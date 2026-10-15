@@ -1,0 +1,27 @@
+# ── Build artifacts ──
+build/
+*.o
+*.d
+*.elf
+*.bin
+*.map
+
+# ── Arduino IDE / PlatformIO ──
+.vscode/
+.pio/
+*.swp
+*.swo
+*~
+
+# ── OS junk ──
+.DS_Store
+Thumbs.db
+desktop.ini
+[Dd]ebug/
+[Rr]elease/
+
+# ── Temporary / extracted files ──
+_temp_*/
+
+# ── Logs captured on PC (keep device SD logs in docs/logs/) ──
+*.log
