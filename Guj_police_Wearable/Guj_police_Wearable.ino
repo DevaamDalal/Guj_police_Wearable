@@ -10,10 +10,22 @@
 #include <Wire.h>
 #include <math.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "ui_bsp.h"
+#include "touch_bsp.h"
+#include "rtc_bsp.h"
+#include "sdlog_bsp.h"
+#include <time.h>
+#include "esp_heap_caps.h"
+
+#define USE_BLE 0   // Stage 1: local only (Serial + AMOLED). Set to 1 for the BLE stage.
+#if USE_BLE
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#endif
 
 // ─────────────────────── PINS FOR ESP32-S3 AMOLED ───────────────────
 // According to Waveshare schematic, onboard peripherals (Touch, IMU, RTC) 
@@ -29,6 +41,7 @@
 #define QMI8658_ADDR   0x6B // Default I2C address for onboard QMI8658
 #define MLX90614_ADDR  0x5A
 
+#if USE_BLE
 // ─────────────────────── BLE UUIDs ──────────────────────────
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -43,14 +56,27 @@ class MyServerCallbacks : public BLEServerCallbacks {
     BLEDevice::startAdvertising();
   }
 };
+#endif
 
 TwoWire I2Cbus = TwoWire(0);
+
+// One mutex for the shared I2C bus: sensors (loop task) and touch (LVGL task).
+SemaphoreHandle_t g_i2cMux = NULL;
+static inline void i2cLock()   { xSemaphoreTake(g_i2cMux, portMAX_DELAY); }
+static inline void i2cUnlock() { xSemaphoreGive(g_i2cMux); }
 
 // ─────────────────────── INTERRUPT FLAGS ────────────────────
 volatile bool imuDataReady = false;
 volatile bool maxDataReady = false;
 void IRAM_ATTR onIMUInterrupt() { imuDataReady = true; }
 void IRAM_ATTR onMAXInterrupt() { maxDataReady = true; }
+
+// ───────────── MAX30102 new-sample gate ─────────────
+// FIFO diagnostic result (2026-10-13): loop() ran ~195 passes/s but the sensor delivers ~25 samples/s, and 90 % of the
+// FIFO reads were EMPTY reads (stale data), all fed into the HR/SpO2 algorithm. The v14 firmware avoided this with the
+// MAX30102 interrupt flag (one pass per sample); the S3 port polls without interrupt. This gate restores that
+// behaviour: read the FIFO pointers and run the algorithm only when a NEW sample is waiting. Set to 0 to go back.
+#define MAX_GATE_NEW_SAMPLE 1
 
 // ─────────────────────── SIGNAL CONSTANTS ───────────────────
 const float    DC_ALPHA                    = 0.985f;
@@ -79,7 +105,9 @@ const float    WRIST_R_MAX                 = 1.30f;
 const float    SPO2_COEFF_A                = 112.5f;
 const float    SPO2_COEFF_B                = 25.0f;
 
-const int      SPO2_MIN_WINDOW_SAMPLES     = 18;
+// Counted in algorithm passes. Old: 18 passes (about 0.1 s of stale-repeated data). With the gate each pass is one real
+// sample (25/s), so 50 samples = 2 s, about 2-3 beats. Needs on-wrist tuning later.
+const int      SPO2_MIN_WINDOW_SAMPLES     = MAX_GATE_NEW_SAMPLE ? 50 : 18;
 const int      SPO2_RESET_WINDOW_SAMPLES   = 150;
 const float    SPO2_MAX_R_CHANGE           = 0.28f;
 const int      SPO2_OUTLIER_HOLD_WINDOWS   = 6;
@@ -158,6 +186,16 @@ unsigned long lastTempRead = 0;
 
 // ─────────────────────── PRINT TIMING ───────────────────────
 unsigned long lastPrint = 0;
+
+// ─────────────────────── LOGGING / RTC / BATTERY STATE ───────────────────────
+const uint32_t LOG_PERIOD_MS = 100;            // SD log rate: 100 ms = 10 rows/s (~10 MB/hour)
+uint32_t lastIR = 0, lastRed = 0;              // latest raw FIFO values (for the logger)
+float lastIrAC = 0, lastRedAC = 0;
+char rtcStr[24] = "RTC invalid";
+RtcTime rtcNow = {2000, 1, 1, 0, 0, 0};          // last RTC reading (for the watch face)
+bool rtcOk = false;
+float battV = 0;
+int battPct = -1;
 
 void writeReg(uint8_t reg, uint8_t val) {
   I2Cbus.beginTransmission(MAX30102_ADDR);
@@ -431,23 +469,283 @@ void updateIMU() {
   else gyroMagFilt = (1.0f - GYRO_EWMA_ALPHA) * gyroMagFilt + GYRO_EWMA_ALPHA * gyroMag;
 }
 
+// Push current readings to the screen (non-blocking, 4 Hz). Called every loop,
+// before any early return, so NO_CONTACT/WARMUP/MOTION states also reach the display.
+void uiPush() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < 250) return;
+  last = now;
+  bool hrShow = hrValid || (lastDisplayedHR > 0 && (now - lastGoodHRMs) <= HR_HOLD_AFTER_IMU_MS);
+  ui_set_values(hrValid ? heartRate : lastDisplayedHR, hrShow,
+                spO2, spo2Valid && spO2 > 0,
+                mlxObjectTemp, mlxAmbientTemp,
+                gyroMotion ? "IMU_MOTION" : statusMsg);
+  ui_set_debug(accelMagFilt, gyroMagFilt, irDC, redDC);
+}
+
+// ───────────── Battery: this board has NO fuel gauge, only a voltage divider on GPIO4 ─────────────
+// Voltage-based % estimate (resting LiPo curve). Reads high while charging / USB powered.
+#define BAT_ADC_PIN 4
+static int battPercentFromMv(int mv) {
+  static const int mvT[] = {3270,3610,3690,3710,3730,3750,3770,3790,3800,3820,3840,
+                            3850,3870,3910,3950,3980,4020,4080,4110,4150,4200};
+  static const int pcT[] = {   0,   5,  10,  15,  20,  25,  30,  35,  40,  45,  50,
+                              55,  60,  65,  70,  75,  80,  85,  90,  95, 100};
+  if (mv <= mvT[0]) return 0;
+  if (mv >= mvT[20]) return 100;
+  for (int i = 1; i < 21; i++)
+    if (mv <= mvT[i]) return pcT[i - 1] + (pcT[i] - pcT[i - 1]) * (mv - mvT[i - 1]) / (mvT[i] - mvT[i - 1]);
+  return 100;
+}
+static void updateBattery() {
+  uint32_t acc = 0;
+  for (int i = 0; i < 8; i++) acc += analogReadMilliVolts(BAT_ADC_PIN);
+  int mv = (int)(acc / 8) * 3;                   // Waveshare demo: 1/3 divider
+  battV = mv / 1000.0f;
+  battPct = (mv < 2500) ? -1 : battPercentFromMv(mv);
+}
+
+// ───────────── RTC helpers ─────────────
+static time_t rtcToEpoch(const RtcTime &t) {
+  struct tm tmv = {};
+  tmv.tm_year = t.year - 1900; tmv.tm_mon = t.month - 1; tmv.tm_mday = t.day;
+  tmv.tm_hour = t.hour; tmv.tm_min = t.min; tmv.tm_sec = t.sec;
+  return mktime(&tmv);
+}
+static void updateRtcStr() {
+  RtcTime t;
+  rtcOk = rtc_get(&t);
+  if (rtcOk) {
+    rtcNow = t;
+    snprintf(rtcStr, sizeof(rtcStr), "%04d-%02d-%02d %02d:%02d:%02d", t.year, t.month, t.day, t.hour, t.min, t.sec);
+  } else snprintf(rtcStr, sizeof(rtcStr), "RTC invalid");
+}
+// If the RTC lost power or is behind this firmware's build time, set it to the build time.
+// (Exact time: send  T2026-10-10 13:20:11  in the Serial Monitor with "Newline" enabled.)
+static void rtcSyncFromBuild() {
+  char mon[4]; int d = 1, y = 2026, h = 0, mi = 0, s = 0;
+  sscanf(__DATE__, "%3s %d %d", mon, &d, &y);
+  sscanf(__TIME__, "%d:%d:%d", &h, &mi, &s);
+  const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *p = strstr(months, mon);
+  RtcTime b = { y, p ? (int)(p - months) / 3 + 1 : 1, d, h, mi, s };
+  RtcTime now;
+  if (!rtc_get(&now) || rtcToEpoch(now) < rtcToEpoch(b)) {
+    Serial.println(rtc_set(&b) ? "RTC set from build time (send T<YYYY-MM-DD HH:MM:SS> to correct)" : "RTC write FAILED");
+  } else {
+    Serial.println("RTC valid");
+  }
+  updateRtcStr();
+}
+// ───────────── FIFO diagnostic (Serial command  F ) ─────────────
+// Question it answers: loop() reads MAX30102 FIFO_DATA on every pass. If loop() runs much faster than
+// the sensor produces samples (about 25/s here), the same sample may be read repeatedly (or an empty
+// FIFO read), which would distort HR/SpO2. For 30 s this records, on every pass, the FIFO write pointer,
+// overflow counter, read pointer and the IR/RED values read, then prints a summary and saves
+// DIAGnnnn.CSV to the SD card. Keep the finger on the sensor, still, while it runs.
+#define DIAG_MAX_ROWS   16000
+#define DIAG_DURATION_MS 30000
+struct DiagRow { uint32_t t_us, ir, red; uint8_t wr, ovf, rd, pad; };
+static DiagRow *diagBuf = NULL;
+static volatile bool diagActive = false;
+static uint32_t diagN = 0, diagStartMs = 0;
+static int32_t diagSaveIdx = -1;                 // >=0 while rows are being written to SD
+static bool diagSdOk = false;
+
+static void diagReadPtrs(uint8_t *wr, uint8_t *ovf, uint8_t *rd) {   // call with the I2C lock held
+  I2Cbus.beginTransmission(MAX30102_ADDR);
+  I2Cbus.write(0x04);
+  I2Cbus.endTransmission(false);
+  if (I2Cbus.requestFrom(MAX30102_ADDR, (uint8_t)3) == 3) {
+    *wr = I2Cbus.read() & 0x1F; *ovf = I2Cbus.read() & 0x1F; *rd = I2Cbus.read() & 0x1F;
+  }
+}
+static void diagRecord(uint8_t wr, uint8_t ovf, uint8_t rd, uint32_t ir, uint32_t red) {
+  if (!diagActive || diagN >= DIAG_MAX_ROWS) return;
+  DiagRow &r = diagBuf[diagN++];
+  r.t_us = micros(); r.ir = ir; r.red = red; r.wr = wr; r.ovf = ovf; r.rd = rd; r.pad = 0;
+}
+static void diagStart() {
+  if (diagActive || diagSaveIdx >= 0) { Serial.println("DIAG already running"); return; }
+  if (!diagBuf) diagBuf = (DiagRow *)heap_caps_malloc(sizeof(DiagRow) * DIAG_MAX_ROWS, MALLOC_CAP_SPIRAM);
+  if (!diagBuf) { Serial.println("DIAG: PSRAM allocation failed"); return; }
+  diagN = 0; diagStartMs = millis(); diagActive = true;
+  Serial.println("DIAG: capturing 30 s - keep the finger still on the sensor");
+}
+static void diagSummary() {
+  if (diagN < 3) { Serial.println("DIAG: too few rows"); return; }
+  uint32_t newS = 0, consumed = 0, changes = 0, processed = 0, empty = 0, maxAvail = 0, maxOvf = 0, maxGapUs = 0;
+  for (uint32_t i = 0; i < diagN; i++) {
+    const DiagRow &r = diagBuf[i];
+    uint32_t avail = (uint32_t)((r.wr - r.rd) & 0x1F);
+    if (avail == 0) empty++;
+    if (avail > maxAvail) maxAvail = avail;
+    if (r.ovf > maxOvf) maxOvf = r.ovf;
+    if (i > 0) {
+      const DiagRow &p = diagBuf[i - 1];
+      newS += (uint32_t)((r.wr - p.wr) & 0x1F);
+      consumed += (uint32_t)((r.rd - p.rd) & 0x1F);
+      if ((r.ir | r.red) && (p.ir | p.red) && (r.ir != p.ir || r.red != p.red)) changes++;
+      if (r.ir | r.red) processed++;
+      if (r.t_us - p.t_us > maxGapUs) maxGapUs = r.t_us - p.t_us;
+    }
+  }
+  float dur = (diagBuf[diagN - 1].t_us - diagBuf[0].t_us) / 1e6f;
+  float passes = diagN / dur, newPs = newS / dur, consPs = consumed / dur, chgPs = changes / dur;
+  Serial.println("──── FIFO DIAGNOSTIC ────");
+  Serial.printf("rows=%lu  duration=%.1f s  loop passes/s=%.1f  longest gap=%.1f ms\n", (unsigned long)diagN, dur, passes, maxGapUs / 1000.0f);
+  Serial.printf("new samples/s (WR ptr)=%.1f  samples consumed/s (RD ptr)=%.1f  value changes/s=%.1f\n", newPs, consPs, chgPs);
+  Serial.printf("passes with empty FIFO=%.0f%%  max backlog=%lu  max overflow counter=%lu\n", 100.0f * empty / diagN, (unsigned long)maxAvail, (unsigned long)maxOvf);
+  Serial.printf("passes that fed the algorithm=%.1f/s (should equal new samples/s)\n", processed / dur);
+#if MAX_GATE_NEW_SAMPLE
+  Serial.println("GATE ON: empty FIFO reads are skipped. Good result = fed/s about equal to new samples/s (about 25) and value changes/s about 25.");
+#else
+  if (passes > 1.5f * newPs && newPs > 0)
+    Serial.printf("VERDICT: loop runs %.1fx faster than the sensor -> most passes re-read old data. Algorithm should be fed once per NEW sample.\n", passes / newPs);
+  else if (maxAvail > 4 || maxOvf > 0)
+    Serial.println("VERDICT: loop is slower than the sensor - backlog/overflow, samples are being lost or delayed.");
+  else
+    Serial.println("VERDICT: loop and sensor rates are matched; the FIFO read is not the cause of the noise.");
+#endif
+}
+static void diagService() {
+  if (diagActive && (millis() - diagStartMs >= DIAG_DURATION_MS || diagN >= DIAG_MAX_ROWS)) {
+    diagActive = false;
+    diagSummary();
+    char name[16];
+    diagSdOk = sdlog_aux_open("DIAG", "CSV", name, sizeof(name));
+    if (diagSdOk) {
+      Serial.printf("DIAG: saving %s\n", name);
+      sdlog_aux_write("t_us,wr,ovf,rd,avail,ir,red\n");
+      diagSaveIdx = 0;
+    } else Serial.println("DIAG: no SD card, summary only");
+  }
+  if (diagSaveIdx >= 0) {                        // write 100 rows per pass so the sensor loop is never stalled
+    char row[48], chunk[48 * 20];
+    for (int k = 0; k < 2 && diagSaveIdx >= 0; k++) {
+      chunk[0] = '\0';
+      size_t len = 0;
+      for (int j = 0; j < 20 && (uint32_t)diagSaveIdx < diagN; j++, diagSaveIdx++) {
+        const DiagRow &r = diagBuf[diagSaveIdx];
+        int n = snprintf(row, sizeof(row), "%lu,%u,%u,%u,%u,%lu,%lu\n", (unsigned long)r.t_us, r.wr, r.ovf, r.rd,
+                         (unsigned)((r.wr - r.rd) & 0x1F), (unsigned long)r.ir, (unsigned long)r.red);
+        memcpy(chunk + len, row, n); len += n; chunk[len] = '\0';
+      }
+      if (len) sdlog_aux_write(chunk);
+      if ((uint32_t)diagSaveIdx >= diagN) { sdlog_aux_close(); diagSaveIdx = -1; Serial.println("DIAG: file saved"); }
+    }
+  }
+}
+
+static void pollSerialCmd() {
+  static char buf[40];
+  static int n = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if ((c == 'F' || c == 'f') && n == 0) { diagStart(); continue; }   // single key press is enough, no Enter needed
+    if (c == '\n' || c == '\r') {
+      if (n > 0) {
+        buf[n] = '\0';
+        if (buf[0] == 'T') {
+          int y, mo, d, h, mi, s;
+          if (sscanf(buf + 1, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+            RtcTime t = { y, mo, d, h, mi, s };
+            Serial.println(rtc_set(&t) ? "RTC set" : "RTC set FAILED");
+            updateRtcStr();
+          } else Serial.println("Use: T2026-10-10 13:20:11");
+        } else if (buf[0] == 'F') {
+          diagStart();
+        }
+        n = 0;
+      }
+    } else if (n < (int)sizeof(buf) - 1) buf[n++] = c;
+  }
+}
+
+// ───────────── SD log: same key=value fields as the Serial line, plus MS / RTC / VBAT ─────────────
+static void buildLogLine(char *out, size_t n) {
+  uint32_t now = millis();
+  bool hrShow = hrValid || (lastDisplayedHR > 0 && (now - lastGoodHRMs) <= HR_HOLD_AFTER_IMU_MS);
+  char hrS[12], spS[12];
+  if (hrShow) snprintf(hrS, sizeof(hrS), "%.1f", hrValid ? heartRate : lastDisplayedHR); else strcpy(hrS, "--");
+  if (spo2Valid && spO2 > 0) snprintf(spS, sizeof(spS), "%.1f%%", spO2); else strcpy(spS, "--");
+  snprintf(out, n,
+    "MS=%lu,RTC=%s,VBAT=%.2f,FIFO_IR=%lu,FIFO_RED=%lu,S1_IR=%02X %02X %02X,S1_RED=%02X %02X %02X,"
+    "IR_DC=%.1f,IR_AC=%.1f,RED_DC=%.1f,RED_AC=%.1f,HR=%s,SpO2=%s,ObjT=%.1f,AmbT=%.1f,"
+    "accX=%.3f,accY=%.3f,accZ=%.3f,accMag=%.3f,accMagF=%.3f,gMagF=%.2f,gX=%.2f,gY=%.2f,gZ=%.2f,ST=%s,Q=%d",
+    (unsigned long)now, rtcStr, battV, (unsigned long)lastIR, (unsigned long)lastRed,
+    (unsigned)((lastIR >> 16) & 0x03), (unsigned)((lastIR >> 8) & 0xFF), (unsigned)(lastIR & 0xFF),
+    (unsigned)((lastRed >> 16) & 0x03), (unsigned)((lastRed >> 8) & 0xFF), (unsigned)(lastRed & 0xFF),
+    irDC, lastIrAC, redDC, lastRedAC, hrS, spS, mlxObjectTemp, mlxAmbientTemp,
+    accX, accY, accZ, accelMagRaw, accelMagFilt, gyroMagFilt, gyroX, gyroY, gyroZ,
+    gyroMotion ? "IMU_MOTION" : statusMsg, qualityScore);
+}
+static void logPush() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < LOG_PERIOD_MS) return;
+  last = now;
+  if (!sdlog_active()) return;
+  char line[SDLOG_LINE_MAX];
+  buildLogLine(line, sizeof(line));
+  sdlog_write(line);
+}
+// 2 Hz: clock + battery for the watch face, text lines for the system page.
+// The battery ADC is only sampled every 5 s (it changes slowly).
+static void infoPush() {
+  static uint32_t last = 0, lastBatt = 0;
+  uint32_t now = millis();
+  if (now - last < 500) return;
+  last = now;
+  if (lastBatt == 0 || now - lastBatt >= 5000) { updateBattery(); lastBatt = now; }
+  updateRtcStr();
+  char l1[40], l2[40], l3[40];
+  if (battPct >= 0) snprintf(l1, sizeof(l1), "Batt %.2f V  ~%d%%", battV, battPct);
+  else              snprintf(l1, sizeof(l1), "Batt --");
+  sdlog_status(l2, sizeof(l2));
+  snprintf(l3, sizeof(l3), "%s", rtcStr);
+  ui_set_info(l1, l2, l3);
+  ui_set_clock(rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec, rtcOk);
+  ui_set_battery(battV, battPct);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  pinMode(QMI_INT_PIN, INPUT);
-  pinMode(MAX_INT_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(QMI_INT_PIN), onIMUInterrupt, RISING);
-  attachInterrupt(digitalPinToInterrupt(MAX_INT_PIN), onMAXInterrupt, FALLING);
+  // No interrupts: IMU and MAX30102 are polled in loop()
+  g_i2cMux = xSemaphoreCreateMutex();
 
   // Use the ESP32-S3 AMOLED I2C pins
   I2Cbus.begin(SDA_PIN, SCL_PIN);
-  I2Cbus.setClock(100000);
+  I2Cbus.setClock(100000);   // keep 100 kHz: MLX90614 max is 100 kHz
 
+  // Sensor + touch init run BEFORE the LVGL task exists, so no locking needed here
   initMAX();
   initQMI8658(); // Replaced MPU initialization with QMI8658
   initMLX90614();
+  Serial.println(touch_init() ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38)");
 
+  // Display first: it needs the biggest contiguous internal-RAM blocks (LVGL draw buffers)
+  lcd_lvgl_Init();   // AMOLED + LVGL + touch polling (own task on core 0)
+  Serial.printf("heap after display: free %u, largest DMA block %u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+  rtcSyncFromBuild();
+  updateBattery();
+  if (sdlog_begin()) {
+    char hdr[SDLOG_LINE_MAX];
+    snprintf(hdr, sizeof(hdr), "# SPANDAN log | start RTC=%s | build %s %s | period=%lu ms | VBAT=%.2f",
+             rtcStr, __DATE__, __TIME__, (unsigned long)LOG_PERIOD_MS, battV);
+    sdlog_write(hdr);
+  } else {
+    Serial.printf("SD not available (%s) - continuing without logging\n", sdlog_last_error());
+  }
+  Serial.printf("heap after SD: free %u, largest DMA block %u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+#if USE_BLE
   BLEDevice::init("SVNIT_CRL_16");
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -459,19 +757,49 @@ void setup() {
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
   BLEDevice::startAdvertising();
+#endif
 
-  Serial.println("\nSVNIT_CRL_16 READY (ESP32-S3 AMOLED)");
+  Serial.println("\nSVNIT_CRL_16 READY (ESP32-S3 AMOLED)  firmware: stage 4c (new-sample gate), build " __DATE__ " " __TIME__);
+  Serial.println("Commands: F = 30 s FIFO diagnostic (just press F, then Send), T2026-10-13 15:30:00 = set clock");
   Serial.println("Columns: FIFO_IR,FIFO_RED,S1_IR,S1_RED,IR_DC,IR_AC,RED_DC,RED_AC,HR,SpO2,ObjT,AmbT,accX,accY,accZ,gX,gY,gZ,ST");
 }
 
 void loop() {
+  i2cLock();
   updateIMU();
   updateTempMLX();
+  i2cUnlock();
+  uiPush();
+  logPush();
+  infoPush();
+  pollSerialCmd();
+  diagService();
+  {   // heartbeat every 5 s so the Serial Monitor shows the sketch is alive even without a finger on the sensor
+    static uint32_t lastBeat = 0;
+    if (millis() - lastBeat >= 5000) {
+      lastBeat = millis();
+      Serial.printf("[alive %lus] ST=%s diag=%s sd=%s\n", (unsigned long)(millis() / 1000),
+                    gyroMotion ? "IMU_MOTION" : statusMsg, diagActive ? "capturing" : "idle", sdlog_active() ? "ok" : "off");
+    }
+  }
 
+  i2cLock();
+  uint8_t dgWr = 0, dgOvf = 0, dgRd = 0;
+#if MAX_GATE_NEW_SAMPLE
+  diagReadPtrs(&dgWr, &dgOvf, &dgRd);                   // FIFO pointers: is a new sample waiting?
+  if (((dgWr - dgRd) & 0x1F) == 0 && dgOvf == 0) {      // empty: nothing new, do not feed stale data to the algorithm
+    i2cUnlock();
+    if (diagActive) diagRecord(dgWr, dgOvf, dgRd, 0, 0);
+    delay(2);
+    return;
+  }
+#else
+  if (diagActive) diagReadPtrs(&dgWr, &dgOvf, &dgRd);   // pointers first, then the sample read below
+#endif
   I2Cbus.beginTransmission(MAX30102_ADDR);
   I2Cbus.write(0x07);
   I2Cbus.endTransmission(false);
-  if (I2Cbus.requestFrom(MAX30102_ADDR, (uint8_t)6) != 6) return;
+  if (I2Cbus.requestFrom(MAX30102_ADDR, (uint8_t)6) != 6) { i2cUnlock(); return; }
 
   uint32_t red = ((uint32_t)I2Cbus.read() << 16) |
                  ((uint32_t)I2Cbus.read() << 8) |
@@ -479,12 +807,15 @@ void loop() {
   uint32_t ir  = ((uint32_t)I2Cbus.read() << 16) |
                  ((uint32_t)I2Cbus.read() << 8) |
                  I2Cbus.read();
+  i2cUnlock();   // all MAX30102 bytes read; rest of loop() does no I2C
   red &= 0x3FFFF;
   ir &= 0x3FFFF;
+  if (diagActive) diagRecord(dgWr, dgOvf, dgRd, ir, red);
   maxDataReady = false;
 
   uint32_t adcIR = ir;
   uint32_t adcRed = red;
+  lastIR = adcIR; lastRed = adcRed;
 
   uint8_t irB0 = (ir >> 16) & 0x03;
   uint8_t irB1 = (ir >> 8) & 0xFF;
@@ -514,6 +845,7 @@ void loop() {
 
   float irAC = (float)adcIR - irDC;
   float redAC = (float)adcRed - redDC;
+  lastIrAC = irAC; lastRedAC = redAC;
 
   if (!hasContact(adcIR, adcRed)) {
     isSignalValid = false;
@@ -772,10 +1104,12 @@ void loop() {
 
     Serial.println(data);
 
+#if USE_BLE
     if (deviceConnected) {
       pCharacteristic->setValue(data.c_str());
       pCharacteristic->notify();
     }
+#endif
 
     lastPrint = millis();
   }
