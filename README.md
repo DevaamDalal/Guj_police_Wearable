@@ -3,8 +3,8 @@
 Health-monitoring wearable firmware: heart rate, SpO2, skin temperature and motion, shown on a local AMOLED
 touchscreen, logged to an SD card, and (later) sent over BLE.
 
-**Last updated:** 2026-10-13 · **Firmware stage:** 4c (local-only: Serial + display + touch + SD log + RTC + watch UI + FIFO diagnostic + new-sample gate) ·
-**Next:** BLE bring-up (Step D). Sensors are still on a breadboard; moving them to a proper mount is planned.
+**Last updated:** 2026-10-15 · **Firmware stage:** 6 v0 (= BLE bring-up; earlier notes call it stage 5): stage 4c + BLE on, compact 1 Hz packet, BT status on the watch face ·
+**Next:** out-of-range reconnect test and memory check (Step D, remaining), then offline buffering (Step E). Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
 **Focus for now:** whole-device functionality first. Sensor tuning and calibration come later, one topic per chat.
 
 ---
@@ -22,7 +22,7 @@ touchscreen, logged to an SD card, and (later) sent over BLE.
 | RTC (PCF85063) | Chip works while the board is powered (log timestamps advance correctly). **Backup cell currently detached**, so time is lost at power-off | Set from build time or `T...` command. Fix the cell later (use a holder or a pre-tabbed cell, never solder onto a bare cell) |
 | Battery level | Voltage-only estimate | Board has **no fuel gauge** |
 | Memory fix (display + SD together) | **Confirmed:** no crash, display and SD run together | Previous build boot-looped, see section 7 |
-| BLE | Disabled (`USE_BLE 0`), code kept | Next major stage |
+| BLE | **Working: connected to the real Spandan app, auto-reconnects after a reboot** (2026-10-15). Out-of-range test pending | Name `SVNIT_CRL_60` (`BLE_DEVICE_NAME` in the .ino), app UUIDs, 1 Hz compact packet (95-99 chars). Needs the 16M partition scheme. **Free internal heap is low with BLE (about 50 KB, largest block 31 KB)**: keep an eye on it |
 | Real watch UI | **Working (confirmed on device)** | Watch face, vitals, system page, swipe navigation |
 | FIFO diagnostic | **Done, found the root cause of the stale-data problem** (2026-10-13) | Serial key `F`, see section 5 |
 | App compatibility (BLE) | **Requirements known** (CSE reply 2026-10-12) | See Step D |
@@ -75,7 +75,7 @@ MAX30102 `0x57` · QMI8658 `0x6B` · MLX90614 `0x5A` · FT3168 touch `0x38` · P
 | CPU Frequency | 240MHz (WiFi) |
 | Flash Mode | **QIO 120MHz** |
 | Flash Size | **16MB (128Mb)** |
-| Partition Scheme | Currently **Default 4MB with spiffs** (works now). **Switch to "16M Flash (3MB APP/9.9MB FATFS)" before enabling BLE.** |
+| Partition Scheme | **16M Flash (3MB APP/9.9MB FATFS)**. Required from stage 5 (BLE makes the program too large for the old "Default 4MB with spiffs"). |
 | PSRAM | **OPI PSRAM** |
 | Upload Speed | 921600 |
 | Other items (USB Mode, Core Debug Level, Events/Arduino core, etc.) | Leave at their defaults |
@@ -177,6 +177,7 @@ accX=,accY=,accZ=,accMag=,accMagF=,gMagF=,gX=,gY=,gZ=,ST=,Q=
 | 2026-10-13 | Stage 4b: FIFO diagnostic (2 runs, finger on sensor) | **loop passes/s 195, new sensor samples/s 25, empty-FIFO passes 90 %, no overflow, max backlog 1.** So about 7.8 of every 8 passes fed stale data into the HR/SpO2 algorithm. The v14 firmware did the same (`maxDataReady` was set by the interrupt but never used to gate), so the algorithm constants were tuned on this behaviour. SD did not mount on this boot (no error text was available). |
 | 2026-10-13 | Stage 4c: new-sample gate | Algorithm now runs only when the FIFO has a new sample (`MAX_GATE_NEW_SAMPLE`, set 0 to revert). `SPO2_MIN_WINDOW_SAMPLES` 18 to 50 under the gate. **Needs on-device comparison.** |
 | 2026-10-13 | Stage 4c on device | Gate works: loop 224 passes/s, **25.0 samples/s fed to the algorithm**, 25 new/s, SD saved `DIAG0001/2.CSV`. HR 63-81, SpO2 84-100 % (spread 3.7). Pulse about 0.26-1 % of DC with strong slow drift (breadboard/finger). Touch OK after boot (check at boot reported not found once). |
+| 2026-10-15 | Stage 6 v0 (BLE) on device | Compiles with 16M partition. Advertises, **connects to the real Spandan app, reconnects automatically after reboot**. Packets 95-99 chars, 1 per second, `HR=--`/`SpO2=--` when no value. Heap: after display 152,828 free (largest DMA 102,388); after SD 125,952 (77,812); **after BLE 50,636 free, largest block 31,732**. nRF Connect test skipped, out-of-range reconnect pending. |
 
 ---
 
@@ -229,19 +230,22 @@ Result in section 7, item 2. The `F` diagnostic stays in the firmware for later 
 ### Step C: Gate the algorithm on new samples (DONE in stage 4c, needs ongoing comparison)
 Implemented (`MAX_GATE_NEW_SAMPLE`). Detailed sensor tuning is deliberately postponed (see "Later chats" below).
 
-### Step D: BLE back on
-1. Partition scheme to "16M Flash (3MB APP/9.9MB FATFS)".
-2. `#define USE_BLE 1`; confirm the BLE code builds on core 3.3.12 (the BLE API differs from 2.x).
-3. Re-check free memory with BLE running (draw buffers can shrink further if needed).
-4. **App requirements (CSE team reply, 2026-10-12):** keep name `SVNIT_CRL_XXX` (registered on the server); keep the service/characteristic UUIDs
-   (`4fafc201-...914b` / `beb5483e-...26a8`, already in the sketch), NOTIFY mandatory, WRITE optional (`AUTH:<token>` handshake, not needed yet).
-   The app parses `HR`, `SpO2`, **`Temp`** (not `ObjT`) and **`Batt`**; field order is free (split on `[,;|]` and `[:=]`); `--` is treated as 0 /
-   calibrating; extra fields are forwarded to the server (IMU values feed their AI models). Rate 1 Hz; keep the BLE packet **under ~200 characters**
-   (the old line is about 380). No bonding. `DISCONNECT` / `SHUTDOWN` in a packet = clean shutdown.
-5. **BLE payload plan:** a separate compact string for BLE (SD log and Serial keep the full line), e.g.
-   `HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,accX=..,accY=..,accZ=..,gX=..,gY=..,gZ=..,ST=OK` (about 110-130 chars). Rename `ObjT` to `Temp`, add `Batt`
-   (percent estimate, no fuel gauge). Decide with the team whether raw `FIFO_IR/FIFO_RED` should also be sent. JSON/binary is welcome later, added alongside the old format.
-6. Test: connect, receive notifications, disconnect/reconnect, with display and SD running.
+### Step D: BLE (BUILT, connected to the real app 2026-10-15; out-of-range reconnect and heap margin still to check)
+Implemented: `USE_BLE 1`; name `SVNIT_CRL_60` (set `BLE_DEVICE_NAME`; the app registers this name on the server, keep the `SVNIT_CRL_` prefix); service `4fafc201-1fb5-459e-8fcc-c5c9c331914b`, characteristic `beb5483e-36e1-4688-b7f5-ea07361b26a8`
+(NOTIFY only); MTU 517 requested; advertises the service UUID, re-advertises after a disconnect; one packet per second even without contact
+(`--` for missing values); `BT waiting` / `BT connected` on the watch face. Packet (about 110-130 characters):
+`HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,accX=..,accY=..,accZ=..,gX=..,gY=..,gZ=..,ST=OK`
+Serial prints `BLE TX (n chars): ...` for each packet, plus `BLE: client connected / disconnected`, and a `heap after BLE` line at boot.
+
+Test procedure: (1) set the partition scheme to 16M, flash, check the Serial shows `BLE advertising as SVNIT_CRL_16` and the heap line.
+(2) nRF Connect on a phone: scan, connect, open the service, enable notifications on the characteristic, check one line per second.
+(3) Disconnect and reconnect (it must advertise again). (4) Real Spandan app: it scans, you select the watch, vitals appear, walk out of range and back.
+(5) Confirm display and SD logging keep running during BLE.
+
+App requirements (CSE team reply, 2026-10-12): keep name `SVNIT_CRL_XXX` (registered on the server) and the UUIDs; NOTIFY mandatory, WRITE optional
+(`AUTH:<token>` handshake, not implemented). App parses `HR`, `SpO2`, `Temp`, `Batt`; field order free; `--` is treated as 0 / calibrating; extra fields go
+to the server (IMU values feed their AI models). 1 Hz, keep under about 200 characters. No bonding. A `DISCONNECT` / `SHUTDOWN` packet means clean shutdown
+(not sent yet, there is no shutdown path). JSON or binary is welcome later, added alongside the old format. Open question for the team: should raw `FIFO_IR/FIFO_RED` also be sent?
 
 ### Step E: Offline buffering ("blackout buffer")
 Use the SD card instead of the LittleFS ring buffer planned earlier (no flash-wear concern): store data while BLE is

@@ -31,6 +31,7 @@ typedef struct {
   char info[3][40];
   int year, mon, day, hour, min, sec;
   bool timeOk;
+  int ble;
   float battV;
   int battPct;
 } ui_data_t;
@@ -42,7 +43,7 @@ static lv_obj_t *tv, *dots[3];
 static int s_page = 0;
 
 // tile 0: watch face
-static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *lbl_mini;
+static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *lbl_mini, *lbl_ble;
 // tile 1: vitals
 static lv_obj_t *arc_ring, *lbl_hr, *lbl_spo2, *lbl_temp, *lbl_status;
 // tile 2: system
@@ -109,6 +110,7 @@ void ui_show_page(int idx) {
 static void build_face(lv_obj_t *t) {
   arc_sec  = make_ring(t, COL_DIM, COL_CYAN, 6);
   make_label(t, &ui_font_s, COL_GREY, "SPANDAN", -150);
+  lbl_ble  = make_label(t, &ui_font_s, COL_GREY, "", -118);
   lbl_time = make_label(t, &ui_font_xl, COL_WHITE, "--:--", -30);
   lbl_date = make_label(t, &ui_font_m, COL_GREY, "RTC not set", 60);
 
@@ -198,6 +200,9 @@ static void update_face(const ui_data_t *d) {
     lv_obj_set_width(bat_fill, 2);
     lv_obj_set_style_bg_color(bat_fill, COL_GREY, 0);
   }
+  if (d->ble == 1)      { set_text(lbl_ble, "BT connected"); lv_obj_set_style_text_color(lbl_ble, COL_CYAN, 0); }
+  else if (d->ble == 0) { set_text(lbl_ble, "BT waiting");   lv_obj_set_style_text_color(lbl_ble, COL_GREY, 0); }
+  else                  { set_text(lbl_ble, ""); }
   char hr[16], sp[16];
   if (d->hrOk) snprintf(hr, sizeof(hr), "%d", (int)(d->hr + 0.5f)); else strcpy(hr, "--");
   if (d->spo2Ok) snprintf(sp, sizeof(sp), "%d", (int)(d->spo2 + 0.5f)); else strcpy(sp, "--");
@@ -253,6 +258,7 @@ void ui_create(void) {
   memset(&g_data, 0, sizeof(g_data));
   strcpy(g_data.st, "STARTING");
   g_data.battPct = -1;
+  g_data.ble = -1;
   strcpy(g_data.info[0], "Batt --"); strcpy(g_data.info[1], "SD: --"); strcpy(g_data.info[2], "RTC --");
 
   lv_obj_t *scr = lv_scr_act();
@@ -342,5 +348,12 @@ void ui_set_battery(float volts, int percent) {
   if (xSemaphoreTake(g_mux, 0) != pdTRUE) return;
   g_data.battV = volts;
   g_data.battPct = percent;
+  xSemaphoreGive(g_mux);
+}
+
+void ui_set_ble(int state) {
+  if (!g_mux) return;
+  if (xSemaphoreTake(g_mux, 0) != pdTRUE) return;
+  g_data.ble = state;
   xSemaphoreGive(g_mux);
 }

@@ -19,7 +19,10 @@
 #include <time.h>
 #include "esp_heap_caps.h"
 
-#define USE_BLE 0   // Stage 1: local only (Serial + AMOLED). Set to 1 for the BLE stage.
+// Device name seen by the app (it registers this name on the server). Keep the SVNIT_CRL_ prefix; change the number per watch.
+#define BLE_DEVICE_NAME "SVNIT_CRL_60"
+#define FW_LABEL        "stage 6 v0 (BLE)"
+#define USE_BLE 1   // 1 = BLE on (stage 5). 0 = local only. BLE needs the 16M partition scheme (see README).
 #if USE_BLE
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -50,9 +53,10 @@ BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
 
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) { deviceConnected = true; }
+  void onConnect(BLEServer *pServer) { deviceConnected = true; Serial.println("BLE: client connected"); }
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
+    Serial.println("BLE: client disconnected, advertising again");
     BLEDevice::startAdvertising();
   }
 };
@@ -691,6 +695,38 @@ static void logPush() {
   buildLogLine(line, sizeof(line));
   sdlog_write(line);
 }
+// ───────────── BLE packet (1 Hz) ─────────────
+// App contract (CSE team): Key=Value pairs separated by commas; it reads HR, SpO2, Temp, Batt; other keys are forwarded to the
+// server. "--" = no reading. Keep under ~200 characters. The SD log and Serial keep the long line.
+static int bleBuildPacket(char *out, size_t n) {
+  uint32_t now = millis();
+  bool hrShow = hrValid || (lastDisplayedHR > 0 && (now - lastGoodHRMs) <= HR_HOLD_AFTER_IMU_MS);
+  char hrS[12], spS[12], bS[8];
+  if (hrShow) snprintf(hrS, sizeof(hrS), "%.1f", hrValid ? heartRate : lastDisplayedHR); else strcpy(hrS, "--");
+  if (spo2Valid && spO2 > 0) snprintf(spS, sizeof(spS), "%.1f", spO2); else strcpy(spS, "--");
+  if (battPct >= 0) snprintf(bS, sizeof(bS), "%d", battPct); else strcpy(bS, "--");
+  return snprintf(out, n,
+    "HR=%s,SpO2=%s,Temp=%.1f,Batt=%s,accX=%.3f,accY=%.3f,accZ=%.3f,gX=%.1f,gY=%.1f,gZ=%.1f,ST=%s",
+    hrS, spS, mlxObjectTemp, bS, accX, accY, accZ, gyroX, gyroY, gyroZ,
+    gyroMotion ? "IMU_MOTION" : statusMsg);
+}
+static void bleNotify() {
+#if USE_BLE
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < 1000) return;
+  last = now;
+  if (!deviceConnected) return;
+  char pkt[200];
+  int len = bleBuildPacket(pkt, sizeof(pkt));
+  if (len <= 0) return;
+  if (len >= (int)sizeof(pkt)) len = sizeof(pkt) - 1;
+  pCharacteristic->setValue((uint8_t *)pkt, (size_t)len);
+  pCharacteristic->notify();
+  Serial.printf("BLE TX (%d chars): %s\n", len, pkt);
+#endif
+}
+
 // 2 Hz: clock + battery for the watch face, text lines for the system page.
 // The battery ADC is only sampled every 5 s (it changes slowly).
 static void infoPush() {
@@ -708,6 +744,9 @@ static void infoPush() {
   ui_set_info(l1, l2, l3);
   ui_set_clock(rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec, rtcOk);
   ui_set_battery(battV, battPct);
+#if USE_BLE
+  ui_set_ble(deviceConnected ? 1 : 0);
+#endif
 }
 
 void setup() {
@@ -746,7 +785,8 @@ void setup() {
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
 #if USE_BLE
-  BLEDevice::init("SVNIT_CRL_16");
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(517);                       // the app asks for 512 on Android; allow it
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
@@ -756,10 +796,16 @@ void setup() {
   );
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
+  BLEAdvertising *pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(SERVICE_UUID);
+  pAdv->setScanResponse(true);
   BLEDevice::startAdvertising();
+  Serial.printf("BLE advertising as %s\n", BLE_DEVICE_NAME);
+  Serial.printf("heap after BLE: free %u, largest block %u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 #endif
 
-  Serial.println("\nSVNIT_CRL_16 READY (ESP32-S3 AMOLED)  firmware: stage 4c (new-sample gate), build " __DATE__ " " __TIME__);
+  Serial.println("\n" BLE_DEVICE_NAME " READY (ESP32-S3 AMOLED)  firmware: " FW_LABEL ", build " __DATE__ " " __TIME__);
   Serial.println("Commands: F = 30 s FIFO diagnostic (just press F, then Send), T2026-10-13 15:30:00 = set clock");
   Serial.println("Columns: FIFO_IR,FIFO_RED,S1_IR,S1_RED,IR_DC,IR_AC,RED_DC,RED_AC,HR,SpO2,ObjT,AmbT,accX,accY,accZ,gX,gY,gZ,ST");
 }
@@ -774,6 +820,7 @@ void loop() {
   infoPush();
   pollSerialCmd();
   diagService();
+  bleNotify();
   {   // heartbeat every 5 s so the Serial Monitor shows the sketch is alive even without a finger on the sensor
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat >= 5000) {
@@ -1104,12 +1151,6 @@ void loop() {
 
     Serial.println(data);
 
-#if USE_BLE
-    if (deviceConnected) {
-      pCharacteristic->setValue(data.c_str());
-      pCharacteristic->notify();
-    }
-#endif
 
     lastPrint = millis();
   }
