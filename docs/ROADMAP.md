@@ -1,8 +1,8 @@
 # Roadmap & Status — Spandan Wearable
 
-> **Current stage:** 6 v0 (BLE bring-up)
-> **Current tag:** `stage6-v0-ble`
-> **Last updated:** 2026-10-15
+> **Current stage:** 7 v0 (BLE + offline buffer)
+> **Current tag:** `stage7-v0-offline-buffer`
+> **Last updated:** 2026-10-18
 
 ---
 
@@ -13,16 +13,16 @@
 | **A** | Board bring-up, QSPI AMOLED, memory fix | ✅ **DONE** | `stage4c-local` | Display + SD run together without boot loop |
 | **B** | FIFO diagnostic | ✅ **DONE** | `stage4c-local` | Root cause: 90% stale reads. `F` command stays in firmware |
 | **C** | New-sample gate for algorithm | ✅ **DONE** | `stage4c-local` | `MAX_GATE_NEW_SAMPLE 1`, SpO2 spread improved |
-| **D** | BLE with Spandan app | ✅ **DONE** (1 pending test) | `stage6-v0-ble` | Connects, reconnects, 95–99 char packets. **Pending: out-of-range test** |
-| **E** | Offline buffering ("blackout buffer") | ⬜ **NOT STARTED** | — | Store data on SD while BLE disconnected, replay later |
-| **F** | UI polish | 🟡 **PARTIAL** | — | BT label done. Remaining: screen timeout, SD/contact icons, brightness |
+| **D** | BLE with Spandan app | ✅ **DONE** | `stage6-v0-ble` | Connects, reconnects, out-of-range test passed (2026-10-16) |
+| **E** | Offline buffering ("blackout buffer") | ✅ **DONE** | `stage7-v0-offline-buffer` | BLEBUF.TXT on SD, replay after reconnect with TS= and BUF=1, verified on device (2026-10-17) |
+| **F** | UI polish | 🟡 **PARTIAL** | — | BT label done, charging bolt done. Remaining: screen timeout, SD/contact icons, brightness |
 | **G** | Power management | ⬜ **NOT STARTED** | — | Display off/dim, lower CPU freq, sleep, verify GPIO42 polarity |
 
 ## Small Cleanups (do with next task)
 
-- [ ] Touch init retry at boot (currently flaky, sometimes says "not found")
-- [ ] Print detected display controller (SH8601/CO5300) at boot
-- [ ] Fix diagnostic "value changes/s" counter (shows 0.0 with gate on — cosmetic)
+- [x] Touch init retries 6× at boot (fixed in stage 7 v0)
+- [x] Print detected display controller (SH8601/CO5300) at boot (fixed in stage 7 v0)
+- [x] Fix diagnostic "value changes/s" counter (fixed in stage 7 v0)
 
 ## Later Chats (after sensors are off breadboard, one topic per chat)
 
@@ -42,6 +42,8 @@
 | `7c62219` | — | docs: Add project context, hardware links, and pinouts to README |
 | `9f11709` | `stage4c-local` | Port to Waveshare ESP32-S3-Touch-AMOLED-1.43: display, touch, watch UI, SD log, RTC, FIFO gate (stage 4c) |
 | `5e5ab57` | `stage6-v0-ble` | BLE tested with the real Spandan app (stage 6 v0); unit name SVNIT_CRL_60 |
+| `8a0b848` | — | repo: Add project docs, AI context, and repo structure |
+| `522c8e1` | `stage7-v0-offline-buffer` | Stage 7 v0: offline BLE buffer on SD, charging bolt, boot cleanups |
 
 ---
 
@@ -56,6 +58,8 @@
 | 2026-10-13 | Stage 4b | FIFO diagnostic: 195 passes/s, 25 new samples/s, 90% empty |
 | 2026-10-13 | Stage 4c | Gate works: 25 samples/s to algorithm, HR 63–81, SpO2 84–100% |
 | 2026-10-15 | Stage 6 v0 | BLE connects to Spandan app, auto-reconnects. Heap: 51 KB free after BLE |
+| 2026-10-16 | Stage 6 v0 | Out-of-range reconnect test passed — Step D fully closed |
+| 2026-10-17 | Stage 7 v0 | Offline buffer replay verified (LOG0015/LOG0016). Charging bolt on watch face confirmed |
 
 ---
 

@@ -6,20 +6,6 @@
 
 ## Open Issues
 
-### #1 — Touch init flaky at boot
-**Severity:** Low (cosmetic — touch works after boot)
-**Since:** Stage 4c
-**Symptom:** Occasionally prints `FT3168 touch NOT found (0x38)` at boot, but touch works fine afterwards.
-**Root cause:** Likely I2C timing at startup, possibly breadboard wiring.
-**Fix planned:** Add retry loop to `touch_init()` (small cleanup task).
-
-### #2 — Diagnostic "value changes/s" counter shows 0.0
-**Severity:** Low (cosmetic — only affects diagnostic output)
-**Since:** Stage 4c (when gate was added)
-**Symptom:** The FIFO diagnostic `F` command reports 0.0 for "value changes/s".
-**Root cause:** Counter compares consecutive rows, but with the gate on, skipped rows show zero change.
-**Fix planned:** Rewrite counter to only compare rows that had new data.
-
 ### #3 — SpO2 reads ~92% on healthy skin
 **Severity:** Medium (sensor calibration, not a code bug)
 **Since:** Always
@@ -27,11 +13,18 @@
 **Fix planned:** Later chat — calibrate against reference oximeter after sensors are mounted properly.
 
 ### #4 — Battery reads high on USB
-**Severity:** Low (known behaviour)
+**Severity:** Low (known behaviour, now understood from schematic)
 **Since:** Always
 **Symptom:** Battery percentage shows inflated values while on USB power.
-**Root cause:** Charger raises voltage above battery level. No fuel gauge on board.
-**Fix planned:** Document as expected. Later: detect USB power and show "Charging" instead of %.
+**Root cause:** Schematic confirms the 200k/100k divider on IO4 samples the **VCC rail**, not the battery directly. On USB the voltage reads ~4.6–4.7 V (charger output). No fuel gauge on board. ETA6098 STAT pin only drives LED2 — no GPIO carries charge status or USB presence.
+**Mitigation:** Charging bolt (⚡) is now shown on the watch face (stage 7 v0), estimated from the voltage trend. To get exact charge status, a wire from ETA6098 STAT (with series resistor) to a free GPIO (e.g. IO18) would be needed — not planned now.
+
+### #8 — Charging estimate can lag up to 1 minute
+**Severity:** Low (cosmetic)
+**Since:** Stage 7 v0
+**Symptom:** The lightning bolt (charging indicator) on the watch face may appear/disappear with up to ~1 minute delay.
+**Root cause:** Charging detection is estimated from voltage trend, not from a hardware charge-status signal. The board has no GPIO connected to ETA6098 STAT.
+**Fix planned:** Not urgent. Could be improved with a STAT→GPIO wire (hardware mod).
 
 ### #5 — RAM tight after BLE (~51 KB free)
 **Severity:** High (blocks new features)
@@ -44,7 +37,18 @@
 **Severity:** Low (display works without it)
 **Since:** Always
 **Symptom:** Cannot use GPIO42 for display power management.
-**Fix planned:** Test with oscilloscope/multimeter before implementing display sleep.
+**Schematic finding (stage 7 v0):** IO42 goes through R9 which is marked **NC** (not connected). IO42 probably does nothing on this board revision.
+**Fix planned:** Verify with multimeter/oscilloscope before implementing display sleep. May be a no-op.
+
+### #9 — Schematic reference findings (stage 7 v0)
+**Severity:** Info (recorded for reference)
+**Since:** Stage 7 v0 analysis
+**Findings:**
+- Battery divider: 200k/100k on IO4, samples the VCC rail (not battery directly)
+- IO42 (AMOLED_EN): goes through R9 marked NC — probably disconnected
+- RTC backup header J2 sits behind diode D1 — check Waveshare wiki for correct cell type
+- LED1 = power LED, LED2 = charge LED (driven by ETA6098 STAT)
+- ETA6098 STAT only drives LED2 — no GPIO reads charge status
 
 ### #7 — RTC backup cell detached
 **Severity:** Medium (time lost at power-off)
@@ -65,3 +69,13 @@
 **Fixed in:** `9f11709` (stage 4c)
 **Root cause:** Main loop at ~200 Hz, MAX30102 at ~25 samples/s → 7.8 of 8 reads were stale.
 **Fix:** `MAX_GATE_NEW_SAMPLE 1` — algorithm only runs on new FIFO data.
+
+### ~#R3~ — Touch init flaky at boot (FIXED stage 7 v0)
+**Fixed in:** `522c8e1` (stage 7 v0)
+**Root cause:** I2C timing at startup.
+**Fix:** `touch_init()` now retries up to 6 times with delay.
+
+### ~#R4~ — Diagnostic "value changes/s" counter shows 0.0 (FIXED stage 7 v0)
+**Fixed in:** `522c8e1` (stage 7 v0)
+**Root cause:** Counter compared consecutive rows; with the gate on, skipped rows showed zero change.
+**Fix:** Counter rewritten to only compare rows with new data.

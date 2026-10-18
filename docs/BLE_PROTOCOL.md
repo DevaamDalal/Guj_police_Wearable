@@ -33,6 +33,8 @@ HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,accX=0.12,accY=-0.05,accZ=9.81,gX=1.2,gY=-0.
 | `accX`, `accY`, `accZ` | float | Accelerometer (g) | `--` |
 | `gX`, `gY`, `gZ` | float | Gyroscope (dps) | `--` |
 | `ST` | string | Status code | `--` |
+| `TS` | string | RTC timestamp (added stage 7 v0). Present on buffered packets; planned for live too | (absent if live, pre-7v1) |
+| `BUF` | int | `1` if this is a replayed offline-buffered packet; absent on live packets | (absent) |
 
 ### Status Codes (`ST`)
 
@@ -61,6 +63,29 @@ HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,accX=0.12,accY=-0.05,accZ=9.81,gX=1.2,gY=-0.
 - `DISCONNECT` / `SHUTDOWN` packet = clean shutdown (not implemented yet, no shutdown path exists)
 - JSON or binary welcome later (added alongside old format)
 
+## CSE Team Reply (2026-10-18) — Stage 7 v1 Requirements
+
+- **Time sync:** App writes `TIME:<epoch>,<offset min>` to the existing characteristic after `AUTH:<token>`
+- **TS format:** ISO with timezone (e.g. `2026-10-18T13:00:00+05:30`)
+- **TS on live packets too** (not just buffered)
+- **Send `CHG` and `BatV`** fields in the packet
+- **Replay pacing:** 50–100 ms between replayed buffered packets
+- **Server handling:** Server stores `BUF=1` packets under their `TS`; app hides them from the live screen
+
+## Offline Buffer (stage 7 v0)
+
+When the BLE app is not connected:
+1. Each 1 Hz packet is appended to `BLEBUF.TXT` on the SD card with `TS=<RTC>` and `BUF=1`
+2. File survives reboot; 20 MB cap (oldest data dropped if exceeded)
+3. All SD work happens in the writer task (no extra RAM allocation beyond a 260 B line buffer)
+
+When the app reconnects:
+1. Stored packets are replayed **oldest first** at 10 packets/second, interleaved with live packets
+2. If the link drops during replay, replay pauses and resumes on next connect
+3. After all buffered packets are sent, `BLEBUF.TXT` is deleted
+4. Serial prints `BLE replay: sending stored packets` and `BLE replay done`
+5. System page shows `buf N` (count of buffered packets waiting)
+
 ## Open Questions
 
 - [ ] Should raw `FIFO_IR` / `FIFO_RED` values be included in the packet? (waiting for app team)
@@ -72,4 +97,6 @@ When BLE is active, Serial prints:
 - `BLE: client connected` — on app connect
 - `BLE: client disconnected` — on app disconnect
 - `BLE TX (95 chars): HR=72.0,...` — each packet
+- `BLE replay: sending stored packets` — when offline buffer replay starts
+- `BLE replay done` — when replay finishes
 - `heap after BLE: free XXXXX, largest XXXXX` — at boot

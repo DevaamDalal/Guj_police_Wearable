@@ -10,10 +10,10 @@ touchscreen, logs to SD card, and transmits over BLE to the "Spandan" mobile app
 
 ## Current State
 
-- **Firmware stage:** 6 v0 (BLE bring-up complete)
-- **Git tag:** `stage6-v0-ble`
-- **What works:** Display, touch, UI (3 screens), SD logging, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app
-- **What's next:** Out-of-range test → small cleanups → offline buffering (Step E) → UI polish (Step F) → power management (Step G)
+- **Firmware stage:** 7 v0 (BLE + offline buffer)
+- **Git tag:** `stage7-v0-offline-buffer`
+- **What works:** Display, touch, UI (3 screens + charging bolt), SD logging, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app, offline buffer with replay
+- **What's next:** Stage 7 v1 (CSE team requirements: time sync, ISO timestamps, CHG/BatV fields) → UI polish (Step F) → power management (Step G)
 
 ## Repo Structure
 
