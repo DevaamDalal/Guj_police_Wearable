@@ -27,6 +27,8 @@ static void example_lvgl_port_task(void *arg);
 static void example_lvgl_unlock(void);
 static bool example_lvgl_lock(int timeout_ms);
 void lcd_lvgl_Init(void);
+const char *lcd_controller_name(void);   // "SH8601" or "CO5300", as detected at boot
+unsigned char lcd_controller_id(void);
 #ifdef __cplusplus
 }
 #endif

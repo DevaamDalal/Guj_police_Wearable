@@ -3,8 +3,8 @@
 Health-monitoring wearable firmware: heart rate, SpO2, skin temperature and motion, shown on a local AMOLED
 touchscreen, logged to an SD card, and (later) sent over BLE.
 
-**Last updated:** 2026-10-15 · **Firmware stage:** 6 v0 (= BLE bring-up; earlier notes call it stage 5): stage 4c + BLE on, compact 1 Hz packet, BT status on the watch face ·
-**Next:** out-of-range reconnect test and memory check (Step D, remaining), then offline buffering (Step E). Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
+**Last updated:** 2026-10-16 · **Firmware stage:** 7 v0 (= stage 6 v0 BLE + offline buffer, charging bolt, boot cleanups) ·
+**Next:** phone time sync over BLE (answered by the CSE team 2026-10-18), then UI polish (Step F) and power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
 **Focus for now:** whole-device functionality first. Sensor tuning and calibration come later, one topic per chat.
 
 ---
@@ -20,7 +20,7 @@ touchscreen, logged to an SD card, and (later) sent over BLE.
 | Touch (FT3168, I2C 0x38) | Working (confirmed on device) | Stage 4: swipe left/right between screens. Sensitivity tunable in `lcd_config.h` (`TOUCH_SCROLL_LIMIT`, `TOUCH_SCROLL_THROW`) |
 | SD logging | **Working (confirmed):** files written, rows about 100 ms apart. One boot (2026-10-13) reported "SD not available" with no reason shown; later boots fine | Card: SanDisk SU01G, 968 MB, SDSC. Stage 4c prints the failure reason |
 | RTC (PCF85063) | Chip works while the board is powered (log timestamps advance correctly). **Backup cell currently detached**, so time is lost at power-off | Set from build time or `T...` command. Fix the cell later (use a holder or a pre-tabbed cell, never solder onto a bare cell) |
-| Battery level | Voltage-only estimate | Board has **no fuel gauge** |
+| Battery level | Voltage-only estimate | Board has **no fuel gauge**. Stage 7 adds a **charging bolt** next to the % (estimate from the voltage: a step up of 80 mV or a rise of 12 mV per minute = charging; a step down or a fall = not charging). It is not a real charge-status signal, so it can lag by up to a minute or miss a full battery on the charger. **Verified on the watch 2026-10-17.** The charger IC (ETA6098) STAT pin only drives the charge LED (LED2) and is not wired to any GPIO |
 | Memory fix (display + SD together) | **Confirmed:** no crash, display and SD run together | Previous build boot-looped, see section 7 |
 | BLE | **Working: connected to the real Spandan app, auto-reconnects after a reboot** (2026-10-15). Out-of-range test pending | Name `SVNIT_CRL_60` (`BLE_DEVICE_NAME` in the .ino), app UUIDs, 1 Hz compact packet (95-99 chars). Needs the 16M partition scheme. **Free internal heap is low with BLE (about 50 KB, largest block 31 KB)**: keep an eye on it |
 | Real watch UI | **Working (confirmed on device)** | Watch face, vitals, system page, swipe navigation |
@@ -177,6 +177,8 @@ accX=,accY=,accZ=,accMag=,accMagF=,gMagF=,gX=,gY=,gZ=,ST=,Q=
 | 2026-10-13 | Stage 4b: FIFO diagnostic (2 runs, finger on sensor) | **loop passes/s 195, new sensor samples/s 25, empty-FIFO passes 90 %, no overflow, max backlog 1.** So about 7.8 of every 8 passes fed stale data into the HR/SpO2 algorithm. The v14 firmware did the same (`maxDataReady` was set by the interrupt but never used to gate), so the algorithm constants were tuned on this behaviour. SD did not mount on this boot (no error text was available). |
 | 2026-10-13 | Stage 4c: new-sample gate | Algorithm now runs only when the FIFO has a new sample (`MAX_GATE_NEW_SAMPLE`, set 0 to revert). `SPO2_MIN_WINDOW_SAMPLES` 18 to 50 under the gate. **Needs on-device comparison.** |
 | 2026-10-13 | Stage 4c on device | Gate works: loop 224 passes/s, **25.0 samples/s fed to the algorithm**, 25 new/s, SD saved `DIAG0001/2.CSV`. HR 63-81, SpO2 84-100 % (spread 3.7). Pulse about 0.26-1 % of DC with strong slow drift (breadboard/finger). Touch OK after boot (check at boot reported not found once). |
+| 2026-10-17 | Stage 7 v0 | Offline buffer replays after reconnect; charging bolt appears when USB is plugged in. Verified by Devaam. |
+| 2026-10-16 | Stage 6 v0 | Out-of-range test passed: the app reconnects after walking out of range and back. |
 | 2026-10-15 | Stage 6 v0 (BLE) on device | Compiles with 16M partition. Advertises, **connects to the real Spandan app, reconnects automatically after reboot**. Packets 95-99 chars, 1 per second, `HR=--`/`SpO2=--` when no value. Heap: after display 152,828 free (largest DMA 102,388); after SD 125,952 (77,812); **after BLE 50,636 free, largest block 31,732**. nRF Connect test skipped, out-of-range reconnect pending. |
 
 ---
@@ -247,9 +249,14 @@ App requirements (CSE team reply, 2026-10-12): keep name `SVNIT_CRL_XXX` (regist
 to the server (IMU values feed their AI models). 1 Hz, keep under about 200 characters. No bonding. A `DISCONNECT` / `SHUTDOWN` packet means clean shutdown
 (not sent yet, there is no shutdown path). JSON or binary is welcome later, added alongside the old format. Open question for the team: should raw `FIFO_IR/FIFO_RED` also be sent?
 
-### Step E: Offline buffering ("blackout buffer")
-Use the SD card instead of the LittleFS ring buffer planned earlier (no flash-wear concern): store data while BLE is
-disconnected, send or upload later. Needs a design decision on format and replay.
+### Step E: Offline buffering ("blackout buffer") (BUILT in stage 7 v0, verified on the watch 2026-10-17)
+While no app is connected, the 1 Hz packet is appended to `BLEBUF.TXT` on the SD card (one line per packet) with two extra keys:
+`TS=2026-10-16T15:30:00` (RTC time, `--` if the RTC is invalid) and `BUF=1` (marks a stored packet). About 3 s after the app reconnects, stored packets
+are sent oldest first, 10 per second, next to the live 1 Hz packets. When the file is empty it is deleted. If the link drops during a replay it pauses and
+resumes at the next unsent line. A leftover `BLEBUF.TXT` after a reboot is replayed on the next connection (a packet in flight at the moment of a power cut may repeat or be skipped).
+Limit 20 MB (about 2 days at 1 Hz), then new packets are dropped. All file work is in the SD writer task, so the sensor loop never waits on the card.
+The system page shows `buf N` (estimated stored packets) while data is waiting. The app and server must tolerate `TS` / `BUF` (extra keys are forwarded to the server per the CSE reply): **ask the CSE team** that replayed `BUF=1` packets are stored with their `TS` and not shown as live.
+Verified on the watch 2026-10-17 (SD logs LOG0015/16): stored packets arrive in a burst right after reconnect. CSE reply 2026-10-18: the app keeps `BUF=1` out of the live screen and the server stores them under their `TS`; wants ISO time with timezone (or epoch) and `TS` on live packets too (planned for stage 7 v1).
 
 ### Step F: UI polish
 Done: watch face, vitals, system page, swipe navigation. Remaining: Bluetooth status icon, brightness / screen timeout
@@ -258,8 +265,8 @@ Done: watch face, vitals, system page, swipe navigation. Remaining: Bluetooth st
 ### Step G: Power
 Display off/dim, lower CPU frequency, log rate options, sleep behaviour; verify GPIO42 polarity before using it.
 
-### Small cleanups (do together with Step D)
-* Make the touch check at boot retry; fix the diagnostic "value changes/s" counter; print the detected display controller at boot.
+### Small cleanups (done in stage 7 v0, need a boot to confirm)
+* Touch check at boot retries 6 times; diagnostic "value changes/s" now compares only rows with a fresh sample; the boot log prints `display controller: SH8601|CO5300 (ID 0x..)`.
 
 ### Later chats (one topic per chat, after the sensors are off the breadboard)
 1. MAX30102 tuning: LED current, amplitude limit, window sizes, on-wrist captures (3 min rest, 3 min movement) with Python analysis.

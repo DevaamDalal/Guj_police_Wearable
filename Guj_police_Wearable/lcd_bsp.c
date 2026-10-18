@@ -218,3 +218,6 @@ void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
   area->x2 = ((x2 >> 1) << 1) + 1;
   area->y2 = ((y2 >> 1) << 1) + 1;
 }
+
+const char *lcd_controller_name(void) { return (READ_LCD_ID == SH8601_ID) ? "SH8601" : "CO5300"; }
+unsigned char lcd_controller_id(void) { return READ_LCD_ID; }

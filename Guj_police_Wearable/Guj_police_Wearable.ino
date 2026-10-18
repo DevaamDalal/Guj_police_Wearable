@@ -21,7 +21,7 @@
 
 // Device name seen by the app (it registers this name on the server). Keep the SVNIT_CRL_ prefix; change the number per watch.
 #define BLE_DEVICE_NAME "SVNIT_CRL_60"
-#define FW_LABEL        "stage 6 v0 (BLE)"
+#define FW_LABEL        "stage 7 v0 (BLE + offline buffer)"
 #define USE_BLE 1   // 1 = BLE on (stage 5). 0 = local only. BLE needs the 16M partition scheme (see README).
 #if USE_BLE
 #include <BLEDevice.h>
@@ -51,9 +51,10 @@
 
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
+volatile uint32_t bleConnectedMs = 0;   // when the app last connected (replay waits a few seconds for it to subscribe)
 
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) { deviceConnected = true; Serial.println("BLE: client connected"); }
+  void onConnect(BLEServer *pServer) { deviceConnected = true; bleConnectedMs = millis(); Serial.println("BLE: client connected"); }
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
     Serial.println("BLE: client disconnected, advertising again");
@@ -200,6 +201,7 @@ RtcTime rtcNow = {2000, 1, 1, 0, 0, 0};          // last RTC reading (for the wa
 bool rtcOk = false;
 float battV = 0;
 int battPct = -1;
+bool battCharging = false;   // estimate from the voltage trend (this board has no charge-status signal we read)
 
 void writeReg(uint8_t reg, uint8_t val) {
   I2Cbus.beginTransmission(MAX30102_ADDR);
@@ -508,6 +510,22 @@ static void updateBattery() {
   int mv = (int)(acc / 8) * 3;                   // Waveshare demo: 1/3 divider
   battV = mv / 1000.0f;
   battPct = (mv < 2500) ? -1 : battPercentFromMv(mv);
+
+  // "Charging" estimate. No fuel gauge / charge-status pin is read, so use the voltage: plugging USB in makes VBAT step up
+  // quickly, a charging cell keeps rising, unplugging makes it step down. One sample every 5 s, trend over 60 s.
+  static float prevV = 0, ring[12];
+  static int rn = 0, ri = 0;
+  if (battPct < 0) { battCharging = false; return; }
+  float dv = (prevV > 0) ? battV - prevV : 0;
+  if (dv >= 0.08f)       battCharging = true;
+  else if (dv <= -0.08f) battCharging = false;
+  else if (rn == 12) {
+    float d60 = battV - ring[ri];              // value 60 s ago
+    if (d60 >= 0.012f)       battCharging = true;
+    else if (d60 <= -0.012f) battCharging = false;
+  }
+  ring[ri] = battV; ri = (ri + 1) % 12; if (rn < 12) rn++;
+  prevV = battV;
 }
 
 // ───────────── RTC helpers ─────────────
@@ -580,6 +598,7 @@ static void diagStart() {
 static void diagSummary() {
   if (diagN < 3) { Serial.println("DIAG: too few rows"); return; }
   uint32_t newS = 0, consumed = 0, changes = 0, processed = 0, empty = 0, maxAvail = 0, maxOvf = 0, maxGapUs = 0;
+  uint32_t lastIr = 0, lastRed = 0; bool haveLast = false;
   for (uint32_t i = 0; i < diagN; i++) {
     const DiagRow &r = diagBuf[i];
     uint32_t avail = (uint32_t)((r.wr - r.rd) & 0x1F);
@@ -590,8 +609,11 @@ static void diagSummary() {
       const DiagRow &p = diagBuf[i - 1];
       newS += (uint32_t)((r.wr - p.wr) & 0x1F);
       consumed += (uint32_t)((r.rd - p.rd) & 0x1F);
-      if ((r.ir | r.red) && (p.ir | p.red) && (r.ir != p.ir || r.red != p.red)) changes++;
-      if (r.ir | r.red) processed++;
+      if (r.ir | r.red) {                                    // rows with a fresh sample: compare with the previous fresh one
+        processed++;
+        if (haveLast && (r.ir != lastIr || r.red != lastRed)) changes++;
+        lastIr = r.ir; lastRed = r.red; haveLast = true;
+      }
       if (r.t_us - p.t_us > maxGapUs) maxGapUs = r.t_us - p.t_us;
     }
   }
@@ -716,14 +738,58 @@ static void bleNotify() {
   uint32_t now = millis();
   if (now - last < 1000) return;
   last = now;
-  if (!deviceConnected) return;
   char pkt[200];
+  if (!deviceConnected) {
+    // No app connected: keep the packet on the SD card (with its time) so it can be replayed after reconnect.
+    if (!sdlog_active()) return;
+    int n = bleBuildPacket(pkt, sizeof(pkt));
+    if (n <= 0 || n > 150) return;
+    char ts[24];
+    if (rtcOk) snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02d", rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec);
+    else strcpy(ts, "--");
+    snprintf(pkt + n, sizeof(pkt) - n, ",TS=%s,BUF=1", ts);
+    if (!sdlog_buf_append(pkt)) Serial.println("BLE buffer: queue full, packet dropped");
+    return;
+  }
   int len = bleBuildPacket(pkt, sizeof(pkt));
   if (len <= 0) return;
   if (len >= (int)sizeof(pkt)) len = sizeof(pkt) - 1;
   pCharacteristic->setValue((uint8_t *)pkt, (size_t)len);
   pCharacteristic->notify();
   Serial.printf("BLE TX (%d chars): %s\n", len, pkt);
+#endif
+}
+
+// After the app reconnects, send the packets stored while it was away (oldest first, 10 per second, flagged BUF=1) alongside the live 1 Hz packets.
+static void bleReplayService() {
+#if USE_BLE
+  static bool on = false;
+  static uint32_t last = 0, sent = 0;
+  uint32_t now = millis();
+  if (!deviceConnected) {                         // link lost: pause (the next line to send stays in the file)
+    if (on && sdlog_buf_replay(false)) { on = false; Serial.printf("BLE replay paused after %lu packets\n", (unsigned long)sent); }
+    return;
+  }
+  if (!on) {
+    if (!sdlog_buf_pending() || now - bleConnectedMs < 3000) return;   // give the app 3 s to subscribe first
+    if (sdlog_buf_replay(true)) { on = true; sent = 0; Serial.println("BLE replay: sending stored packets"); }
+    return;
+  }
+  if (now - last < 100) return;
+  last = now;
+  char line[SDLOG_LINE_MAX];
+  int r = sdlog_buf_replay_get(line, sizeof(line));
+  if (r == 1) {
+    size_t len = strlen(line);
+    if (len > 199) len = 199;
+    pCharacteristic->setValue((uint8_t *)line, len);
+    pCharacteristic->notify();
+    sent++;
+    if (sent % 50 == 1) Serial.printf("BLE replay #%lu: %s\n", (unsigned long)sent, line);
+  } else if (r < 0) {
+    on = false;
+    Serial.printf("BLE replay done: %lu stored packets sent\n", (unsigned long)sent);
+  }
 #endif
 }
 
@@ -737,13 +803,17 @@ static void infoPush() {
   if (lastBatt == 0 || now - lastBatt >= 5000) { updateBattery(); lastBatt = now; }
   updateRtcStr();
   char l1[40], l2[40], l3[40];
-  if (battPct >= 0) snprintf(l1, sizeof(l1), "Batt %.2f V  ~%d%%", battV, battPct);
+  if (battPct >= 0) snprintf(l1, sizeof(l1), "Batt %.2f V  ~%d%%%s", battV, battPct, battCharging ? " CHG" : "");
   else              snprintf(l1, sizeof(l1), "Batt --");
   sdlog_status(l2, sizeof(l2));
+  if (sdlog_buf_pending() && strlen(l2) < 26) {   // show how much BLE data is waiting for the app
+    unsigned long by, dr; sdlog_buf_info(&by, &dr);
+    snprintf(l2 + strlen(l2), sizeof(l2) - strlen(l2), " buf %lu", by / 130UL);
+  }
   snprintf(l3, sizeof(l3), "%s", rtcStr);
   ui_set_info(l1, l2, l3);
   ui_set_clock(rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec, rtcOk);
-  ui_set_battery(battV, battPct);
+  ui_set_battery(battV, battPct, battCharging);
 #if USE_BLE
   ui_set_ble(deviceConnected ? 1 : 0);
 #endif
@@ -764,10 +834,15 @@ void setup() {
   initMAX();
   initQMI8658(); // Replaced MPU initialization with QMI8658
   initMLX90614();
-  Serial.println(touch_init() ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38)");
+  {   // the touch chip can need a moment after power-up: retry a few times before giving up
+    bool touchOk = false;
+    for (int i = 0; i < 6 && !touchOk; i++) { touchOk = touch_init(); if (!touchOk) delay(50); }
+    Serial.println(touchOk ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38) after 6 tries");
+  }
 
   // Display first: it needs the biggest contiguous internal-RAM blocks (LVGL draw buffers)
   lcd_lvgl_Init();   // AMOLED + LVGL + touch polling (own task on core 0)
+  Serial.printf("display controller: %s (ID 0x%02X)\n", lcd_controller_name(), lcd_controller_id());
   Serial.printf("heap after display: free %u, largest DMA block %u\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
@@ -821,6 +896,7 @@ void loop() {
   pollSerialCmd();
   diagService();
   bleNotify();
+  bleReplayService();
   {   // heartbeat every 5 s so the Serial Monitor shows the sketch is alive even without a finger on the sensor
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat >= 5000) {

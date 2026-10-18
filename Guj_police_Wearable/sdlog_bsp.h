@@ -19,6 +19,14 @@ bool sdlog_aux_open(const char *prefix, const char *ext, char *nameOut, size_t n
 bool sdlog_aux_write(const char *text);          // false on write error
 void sdlog_aux_close(void);
 
+// Offline buffer ("blackout buffer"): packets that could not be sent over BLE are appended to BLEBUF.TXT (one line each)
+// and replayed, oldest first, after the app reconnects. All file work happens in the SD writer task; these calls never block.
+bool sdlog_buf_append(const char *line);         // queue one line for BLEBUF.TXT; false if the queue is full / no card
+bool sdlog_buf_pending(void);                    // true while BLEBUF.TXT holds lines that were not delivered yet
+bool sdlog_buf_replay(bool start);               // true = begin/resume replay, false = pause it (link lost). false return = retry
+int  sdlog_buf_replay_get(char *out, size_t n);  // 1 = line returned, 0 = nothing yet (call again), -1 = replay finished (file deleted)
+void sdlog_buf_info(unsigned long *bytes, unsigned long *dropped);
+
 #ifdef __cplusplus
 }
 #endif

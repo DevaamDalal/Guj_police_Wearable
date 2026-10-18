@@ -23,6 +23,13 @@
 #define SD_MOUNT      "/sd_card"
 #define SDLOG_QUEUE_LEN 40
 #define SDLOG_FLUSH_MS  2000
+#define BUF_PATH        SD_MOUNT "/BLEBUF.TXT"
+#define BUF_MAX_BYTES   (20UL * 1024UL * 1024UL)   // about 2 days of 1 Hz packets; beyond that new lines are dropped
+#define BUF_LINE_MAX    260
+// Queue items starting with these bytes are commands for the writer task, not log lines.
+#define CMD_BUF_APPEND  '\x01'
+#define CMD_RP_START    '\x02'
+#define CMD_RP_STOP     '\x03'
 
 static sdmmc_card_t *s_card = NULL;
 static FILE *s_file = NULL;
@@ -33,21 +40,97 @@ static char s_name[12] = "";
 static char s_err[64] = "";
 const char *sdlog_last_error(void) { return s_err; }
 
+// ---- offline buffer state (only touched by the writer task, except where marked) ----
+static FILE *s_bf = NULL;                          // BLEBUF.TXT, opened "a+" (one handle: append at the end, read at s_rd_pos)
+static long s_rd_pos = 0;                          // start of the next line to deliver
+static volatile bool s_buf_pending = false;        // read by the loop task
+static volatile unsigned long s_buf_bytes = 0, s_buf_dropped = 0;
+static bool s_buf_dirty = false;
+static volatile bool s_rp_on = false;              // replay requested
+static volatile int s_rp_state = 0;                // 0 idle, 1 loop wants a line, 2 line ready, 3 finished
+static char s_rp_line[BUF_LINE_MAX];
+static volatile long s_rp_next = 0;
+
+static void bufAppend(const char *text)
+{
+  if (s_bf == NULL) s_bf = fopen(BUF_PATH, "a+");
+  if (s_bf == NULL) { s_buf_dropped++; return; }
+  if (s_buf_bytes >= BUF_MAX_BYTES) { s_buf_dropped++; return; }
+  size_t n = strlen(text);
+  fseek(s_bf, 0, SEEK_END);
+  if (fputs(text, s_bf) < 0 || fputc('\n', s_bf) < 0) { s_buf_dropped++; return; }
+  s_buf_bytes += n + 1;
+  s_buf_pending = true;
+  s_buf_dirty = true;
+}
+
+static void bufFinish(void)                        // everything delivered: remove the file
+{
+  if (s_bf != NULL) { fclose(s_bf); s_bf = NULL; }
+  remove(BUF_PATH);
+  s_rd_pos = 0; s_buf_bytes = 0; s_buf_dirty = false;
+  s_buf_pending = false;
+  s_rp_on = false;
+  s_rp_state = 3;
+}
+
+static void bufReplayStart(void)
+{
+  s_rp_on = true;
+  if (!s_buf_pending) { s_rp_state = 3; s_rp_on = false; return; }
+  if (s_bf == NULL) s_bf = fopen(BUF_PATH, "a+");
+  if (s_bf == NULL) { s_buf_pending = false; s_rp_state = 3; s_rp_on = false; return; }
+  s_rp_state = 0;                                  // the loop task asks for the first line
+}
+
+static void bufReplayStop(void)
+{
+  s_rp_on = false;
+  s_rp_state = 0;                                  // s_rd_pos only moves when a line is taken, so an unsent line is not lost
+}
+
+static void bufReplayRead(void)                    // called when s_rp_state == 1
+{
+  if (s_bf == NULL) { bufFinish(); return; }
+  for (int tries = 0; tries < 8; tries++)
+  {
+    fseek(s_bf, s_rd_pos, SEEK_SET);
+    if (fgets(s_rp_line, sizeof(s_rp_line), s_bf) == NULL)
+    {
+      bufFinish();                                 // end of file: all delivered
+      return;
+    }
+    long next = ftell(s_bf);
+    size_t n = strlen(s_rp_line);
+    while (n > 0 && (s_rp_line[n - 1] == '\n' || s_rp_line[n - 1] == '\r')) s_rp_line[--n] = '\0';
+    if (n < 8) { s_rd_pos = next; continue; }      // empty or torn line (power loss): skip it
+    s_rp_next = next;
+    __sync_synchronize();
+    s_rp_state = 2;
+    return;
+  }
+}
+
 static void sdlog_task(void *arg)
 {
   static char line[SDLOG_LINE_MAX];
   TickType_t lastFlush = xTaskGetTickCount();
   for (;;)
   {
-    if (xQueueReceive(s_q, line, pdMS_TO_TICKS(500)) == pdTRUE && s_state == 1)
+    if (xQueueReceive(s_q, line, pdMS_TO_TICKS(s_rp_on ? 40 : 500)) == pdTRUE && s_state == 1)
     {
-      if (fputs(line, s_file) < 0 || fputc('\n', s_file) < 0) s_state = 2;
+      if (line[0] == CMD_BUF_APPEND)      bufAppend(line + 1);
+      else if (line[0] == CMD_RP_START)   bufReplayStart();
+      else if (line[0] == CMD_RP_STOP)    bufReplayStop();
+      else if (fputs(line, s_file) < 0 || fputc('\n', s_file) < 0) s_state = 2;
       else s_rows++;
     }
+    if (s_state == 1 && s_rp_on && s_rp_state == 1) bufReplayRead();
     if (s_state == 1 && (xTaskGetTickCount() - lastFlush) >= pdMS_TO_TICKS(SDLOG_FLUSH_MS))
     {
       if (fflush(s_file) != 0) s_state = 2;
       else fsync(fileno(s_file));
+      if (s_bf != NULL && s_buf_dirty) { fflush(s_bf); fsync(fileno(s_bf)); s_buf_dirty = false; }
       lastFlush = xTaskGetTickCount();
     }
   }
@@ -99,6 +182,13 @@ bool sdlog_begin(void)
   }
   s_file = fopen(path, "w");
   if (s_file == NULL) { snprintf(s_err, sizeof(s_err), "cannot create %s", path); return false; }
+
+  if (stat(BUF_PATH, &st) == 0 && st.st_size > 0)   // lines left over from before a reboot are replayed when the app connects
+  {
+    s_buf_bytes = (unsigned long)st.st_size;
+    s_buf_pending = true;
+    printf("SD: %lu bytes of undelivered BLE data found in BLEBUF.TXT\n", s_buf_bytes);
+  }
 
   s_q = xQueueCreate(SDLOG_QUEUE_LEN, SDLOG_LINE_MAX);
   if (s_q == NULL) { fclose(s_file); s_file = NULL; snprintf(s_err, sizeof(s_err), "log queue allocation failed (RAM)"); return false; }
@@ -155,3 +245,40 @@ void sdlog_aux_close(void)
 {
   if (s_aux != NULL) { fflush(s_aux); fsync(fileno(s_aux)); fclose(s_aux); s_aux = NULL; }
 }
+
+// ---- offline buffer: calls made from the loop task ----
+static bool bufSend(char cmd, const char *text)
+{
+  if (s_state != 1 || s_q == NULL) return false;
+  char tmp[SDLOG_LINE_MAX];
+  tmp[0] = cmd;
+  if (text) { strncpy(tmp + 1, text, SDLOG_LINE_MAX - 2); tmp[SDLOG_LINE_MAX - 1] = '\0'; }
+  else tmp[1] = '\0';
+  return xQueueSend(s_q, tmp, 0) == pdTRUE;
+}
+
+bool sdlog_buf_append(const char *line) { return bufSend(CMD_BUF_APPEND, line); }
+bool sdlog_buf_pending(void) { return s_buf_pending; }
+bool sdlog_buf_replay(bool start)
+{
+  if (start) s_rp_state = 0;
+  return bufSend(start ? CMD_RP_START : CMD_RP_STOP, NULL);
+}
+
+int sdlog_buf_replay_get(char *out, size_t n)
+{
+  int st = s_rp_state;
+  if (st == 3) return -1;
+  if (st == 2)
+  {
+    __sync_synchronize();
+    strncpy(out, s_rp_line, n - 1); out[n - 1] = '\0';
+    s_rd_pos = s_rp_next;                          // the line is taken; next read starts after it
+    s_rp_state = 0;
+    return 1;
+  }
+  if (st == 0) s_rp_state = 1;                     // ask the writer task for the next line
+  return 0;
+}
+
+void sdlog_buf_info(unsigned long *bytes, unsigned long *dropped) { *bytes = s_buf_bytes; *dropped = s_buf_dropped; }

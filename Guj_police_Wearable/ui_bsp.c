@@ -34,6 +34,7 @@ typedef struct {
   int ble;
   float battV;
   int battPct;
+  bool charging;
 } ui_data_t;
 
 static ui_data_t g_data;
@@ -43,7 +44,7 @@ static lv_obj_t *tv, *dots[3];
 static int s_page = 0;
 
 // tile 0: watch face
-static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *lbl_mini, *lbl_ble;
+static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *bat_bolt, *lbl_mini, *lbl_ble;
 // tile 1: vitals
 static lv_obj_t *arc_ring, *lbl_hr, *lbl_spo2, *lbl_temp, *lbl_status;
 // tile 2: system
@@ -117,8 +118,8 @@ static void build_face(lv_obj_t *t) {
   // battery icon built from plain rectangles
   lv_obj_t *row = lv_obj_create(t);
   style_plain(row);
-  lv_obj_set_size(row, 150, 28);
-  lv_obj_align(row, LV_ALIGN_CENTER, 0, 118);
+  lv_obj_set_size(row, 180, 28);                 // wider than the icon + text so the charging bolt fits after "100%"
+  lv_obj_align(row, LV_ALIGN_CENTER, 15, 118);   // x offset keeps the icon where it was
   lv_obj_t *body = lv_obj_create(row);
   style_plain(body);
   lv_obj_set_size(body, 46, 24);
@@ -144,6 +145,16 @@ static void build_face(lv_obj_t *t) {
   lv_obj_set_style_text_color(lbl_bat, COL_WHITE, 0);
   lv_label_set_text(lbl_bat, "--%");
   lv_obj_set_pos(lbl_bat, 62, -1);
+  {   // small lightning bolt shown while charging
+    static const lv_point_t bolt_pts[] = { {9, 0}, {1, 14}, {7, 14}, {5, 25}, {13, 9}, {7, 9}, {9, 0} };
+    bat_bolt = lv_line_create(row);
+    lv_line_set_points(bat_bolt, bolt_pts, 7);
+    lv_obj_set_style_line_width(bat_bolt, 3, 0);
+    lv_obj_set_style_line_color(bat_bolt, COL_AMBER, 0);
+    lv_obj_set_style_line_rounded(bat_bolt, true, 0);
+    lv_obj_set_pos(bat_bolt, 132, 1);
+    lv_obj_add_flag(bat_bolt, LV_OBJ_FLAG_HIDDEN);
+  }
 
   lbl_mini = make_label(t, &ui_font_s, COL_RED, "HR -- bpm    SpO2 --%", 162);
 }
@@ -200,6 +211,8 @@ static void update_face(const ui_data_t *d) {
     lv_obj_set_width(bat_fill, 2);
     lv_obj_set_style_bg_color(bat_fill, COL_GREY, 0);
   }
+  if (d->charging && d->battPct >= 0) { lv_obj_update_layout(lbl_bat); lv_obj_align_to(bat_bolt, lbl_bat, LV_ALIGN_OUT_RIGHT_MID, 6, 0); lv_obj_clear_flag(bat_bolt, LV_OBJ_FLAG_HIDDEN); }
+  else                                lv_obj_add_flag(bat_bolt, LV_OBJ_FLAG_HIDDEN);
   if (d->ble == 1)      { set_text(lbl_ble, "BT connected"); lv_obj_set_style_text_color(lbl_ble, COL_CYAN, 0); }
   else if (d->ble == 0) { set_text(lbl_ble, "BT waiting");   lv_obj_set_style_text_color(lbl_ble, COL_GREY, 0); }
   else                  { set_text(lbl_ble, ""); }
@@ -343,11 +356,12 @@ void ui_set_clock(int year, int mon, int day, int hour, int min, int sec, bool v
   xSemaphoreGive(g_mux);
 }
 
-void ui_set_battery(float volts, int percent) {
+void ui_set_battery(float volts, int percent, bool charging) {
   if (!g_mux) return;
   if (xSemaphoreTake(g_mux, 0) != pdTRUE) return;
   g_data.battV = volts;
   g_data.battPct = percent;
+  g_data.charging = charging;
   xSemaphoreGive(g_mux);
 }
 
