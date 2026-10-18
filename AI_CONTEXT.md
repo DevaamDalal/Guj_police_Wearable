@@ -10,10 +10,10 @@ touchscreen, logs to SD card, and transmits over BLE to the "Spandan" mobile app
 
 ## Current State
 
-- **Firmware stage:** 7 v0 (BLE + offline buffer)
-- **Git tag:** `stage7-v0-offline-buffer`
-- **What works:** Display, touch, UI (3 screens + charging bolt), SD logging, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app, offline buffer with replay
-- **What's next:** Stage 7 v1 (CSE team requirements: time sync, ISO timestamps, CHG/BatV fields) → UI polish (Step F) → power management (Step G)
+- **Firmware stage:** 7 v2 (BLE + offline buffer + time sync + screen settings + event log)
+- **Git tag:** `stage7-v2-settings-eventlog`
+- **What works:** Display, touch, UI (4 screens: watch face, vitals, system, settings), screen timeout / touch wake, SD logging + SYSLOG.TXT event log, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app with offline buffer replay, inbound TIME sync & AUTH handling
+- **What's next:** On-device testing of stage 7 v2 → UI polish icons (Step F completion) → Power management (Step G)
 
 ## Repo Structure
 

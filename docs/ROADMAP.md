@@ -1,7 +1,7 @@
 # Roadmap & Status — Spandan Wearable
 
-> **Current stage:** 7 v0 (BLE + offline buffer)
-> **Current tag:** `stage7-v0-offline-buffer`
+> **Current stage:** 7 v2 (settings + event log + time sync test helpers)
+> **Current tag:** `stage7-v2-settings-eventlog`
 > **Last updated:** 2026-10-18
 
 ---
@@ -15,8 +15,8 @@
 | **C** | New-sample gate for algorithm | ✅ **DONE** | `stage4c-local` | `MAX_GATE_NEW_SAMPLE 1`, SpO2 spread improved |
 | **D** | BLE with Spandan app | ✅ **DONE** | `stage6-v0-ble` | Connects, reconnects, out-of-range test passed (2026-10-16) |
 | **E** | Offline buffering ("blackout buffer") | ✅ **DONE** | `stage7-v0-offline-buffer` | BLEBUF.TXT on SD, replay after reconnect with TS= and BUF=1, verified on device (2026-10-17) |
-| **F** | UI polish | 🟡 **PARTIAL** | — | BT label done, charging bolt done. Remaining: screen timeout, SD/contact icons, brightness |
-| **G** | Power management | ⬜ **NOT STARTED** | — | Display off/dim, lower CPU freq, sleep, verify GPIO42 polarity |
+| **F** | UI polish & settings | 🟡 **NEARLY DONE** | `stage7-v2-settings-eventlog` | 4th page (settings: brightness 10-100%, screen timeout 15s..Never, NVS persist), screen off & touch wake, BT label, charging bolt. Remaining: SD/contact icons, wake on wrist raise |
+| **G** | Power management | ⬜ **NOT STARTED** | — | Display off/dim (panel DISPOFF in 7v2), lower CPU freq, sleep, verify GPIO42 polarity |
 
 ## Small Cleanups (do with next task)
 
@@ -44,6 +44,7 @@
 | `5e5ab57` | `stage6-v0-ble` | BLE tested with the real Spandan app (stage 6 v0); unit name SVNIT_CRL_60 |
 | `8a0b848` | — | repo: Add project docs, AI context, and repo structure |
 | `522c8e1` | `stage7-v0-offline-buffer` | Stage 7 v0: offline BLE buffer on SD, charging bolt, boot cleanups |
+| `577cac1` | `stage7-v2-settings-eventlog` | Stage 7 v2: screen timeout and brightness, SD event log, time sync test helpers |
 
 ---
 
@@ -60,6 +61,7 @@
 | 2026-10-15 | Stage 6 v0 | BLE connects to Spandan app, auto-reconnects. Heap: 51 KB free after BLE |
 | 2026-10-16 | Stage 6 v0 | Out-of-range reconnect test passed — Step D fully closed |
 | 2026-10-17 | Stage 7 v0 | Offline buffer replay verified (LOG0015/LOG0016). Charging bolt on watch face confirmed |
+| 2026-10-18 | Stage 7 v2 | Syntax checked with stubs; SD event log & buffer logic host-tested. On-device test pending: settings page, screen off/touch wake, nRF Connect TIME sync, SYSLOG.TXT |
 
 ---
 

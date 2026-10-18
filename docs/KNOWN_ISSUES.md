@@ -27,11 +27,23 @@
 **Fix planned:** Not urgent. Could be improved with a STAT→GPIO wire (hardware mod).
 
 ### #5 — RAM tight after BLE (~51 KB free)
-**Severity:** High (blocks new features)
-**Since:** Stage 6 v0
-**Symptom:** After BLE init, only ~51 KB internal RAM free (largest block ~32 KB).
-**Root cause:** BLE stack consumes ~75 KB internal RAM.
-**Mitigation:** Use PSRAM for any new large allocations. Monitor heap at boot.
+**Severity:** High (requires continuous heap watch)
+**Since:** Stage 6 v0 (updated in Stage 7 v2)
+**Symptom:** After BLE init, ~51 KB internal RAM free (largest block ~32 KB).
+**Stage 7 v2 impact:** Adds 3 open files in SD module (~1.5 KB each) and 9 LVGL objects on settings page.
+**Mitigation:** Use PSRAM for any large buffers. Monitor `heap after BLE` in boot log and check minfree numbers reported in periodic (60s) `STATUS` lines in `SYSLOG.TXT`.
+
+### #10 — AUTH token value open (waiting for CSE team)
+**Severity:** Medium (blocks secured BLE write validation)
+**Since:** Stage 7 v1 / v2
+**Symptom:** The exact authentication token required for `AUTH:<token>` is not yet specified by the CSE app team.
+**Mitigation:** Default token is empty (`""`). In this state, `TIME` sync is accepted whenever the watch clock is untrusted or unset. The token can be set without recompiling via Serial command `A<token>` and is saved in NVS.
+
+### #11 — Settings buttons act on press
+**Severity:** Low (UI quirk)
+**Since:** Stage 7 v2
+**Symptom:** The settings page buttons (- and + for brightness and timeout) act on press. A swipe gesture between pages that begins on a button can trigger a one-step setting change.
+**Fix planned:** Switch button event handler from `LV_EVENT_PRESSED` to `LV_EVENT_SHORT_CLICKED` or check for drag state.
 
 ### #6 — GPIO42 (AMOLED_EN) polarity unknown
 **Severity:** Low (display works without it)
