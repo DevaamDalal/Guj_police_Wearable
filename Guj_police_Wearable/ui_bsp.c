@@ -40,13 +40,17 @@ typedef struct {
 static ui_data_t g_data;
 static SemaphoreHandle_t g_mux = NULL;
 
-static lv_obj_t *tv, *dots[3];
+#define NUM_PAGES 4
+static lv_obj_t *tv, *dots[NUM_PAGES];
 static int s_page = 0;
 
 // tile 0: watch face
 static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *bat_bolt, *lbl_mini, *lbl_ble;
 // tile 1: vitals
 static lv_obj_t *arc_ring, *lbl_hr, *lbl_spo2, *lbl_temp, *lbl_status;
+// tile 2: system
+// tile 3: settings
+static lv_obj_t *lbl_bright, *lbl_tmo;
 // tile 2: system
 static lv_obj_t *lbl_acc, *lbl_gyr, *lbl_ir, *lbl_red, *lbl_touch, *lbl_i1, *lbl_i2, *lbl_i3;
 
@@ -94,14 +98,14 @@ static void page_changed_cb(lv_event_t *e) {
   (void)e;
   lv_obj_t *act = lv_tileview_get_tile_act(tv);
   if (act) s_page = (int)(intptr_t)lv_obj_get_user_data(act);   // NULL until the first layout pass
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NUM_PAGES; i++) {
     lv_obj_set_style_bg_color(dots[i], i == s_page ? COL_WHITE : lv_color_hex(0x40444A), 0);
     lv_obj_set_size(dots[i], i == s_page ? 10 : 8, i == s_page ? 10 : 8);
   }
 }
 
 void ui_show_page(int idx) {
-  if (idx < 0 || idx > 2) return;
+  if (idx < 0 || idx >= NUM_PAGES) return;
   lv_obj_set_tile_id(tv, (uint32_t)idx, 0, LV_ANIM_OFF);
   s_page = idx;
   page_changed_cb(NULL);
@@ -183,6 +187,69 @@ static void build_system(lv_obj_t *t) {
   lbl_i3    = make_label(t, &ui_font_s, COL_AMBER, "RTC --",      115);
 }
 
+// tile 3: settings (brightness and screen timeout). Buttons act on press; values are applied by lcd_bsp.c.
+static const int k_timeouts[] = {15, 30, 60, 120, 300, 0};      // seconds, 0 = never
+#define N_TIMEOUTS ((int)(sizeof(k_timeouts) / sizeof(k_timeouts[0])))
+
+static void fmt_timeout(char *b, size_t n, int s) {
+  if (s == 0) snprintf(b, n, "Never");
+  else if (s < 60) snprintf(b, n, "%d s", s);
+  else snprintf(b, n, "%d min", s / 60);
+}
+
+static void update_settings(void) {
+  char b[24];
+  snprintf(b, sizeof(b), "%d%%", lcd_get_brightness());
+  set_text(lbl_bright, b);
+  fmt_timeout(b, sizeof(b), lcd_get_screen_timeout());
+  set_text(lbl_tmo, b);
+}
+
+static void settings_btn_cb(lv_event_t *e) {
+  int code = (int)(intptr_t)lv_event_get_user_data(e);
+  if (code == 0 || code == 1) {
+    lcd_set_brightness(lcd_get_brightness() + (code == 1 ? 10 : -10));
+  } else {
+    int cur = lcd_get_screen_timeout(), idx = 0;
+    for (int i = 0; i < N_TIMEOUTS; i++) if (k_timeouts[i] == cur) idx = i;
+    idx += (code == 3) ? 1 : -1;
+    if (idx < 0) idx = 0;
+    if (idx >= N_TIMEOUTS) idx = N_TIMEOUTS - 1;
+    lcd_set_screen_timeout(k_timeouts[idx]);
+  }
+  update_settings();
+}
+
+static void make_btn(lv_obj_t *parent, const char *txt, lv_coord_t x, lv_coord_t y, int code) {
+  lv_obj_t *b = lv_btn_create(parent);
+  lv_obj_remove_style_all(b);
+  lv_obj_set_size(b, 84, 66);
+  lv_obj_align(b, LV_ALIGN_CENTER, x, y);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(0x2A2D33), 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(0x4A505A), LV_STATE_PRESSED);
+  lv_obj_set_style_radius(b, 20, 0);
+  lv_obj_t *l = lv_label_create(b);
+  lv_obj_set_style_text_font(l, &ui_font_m, 0);
+  lv_obj_set_style_text_color(l, COL_WHITE, 0);
+  lv_label_set_text(l, txt);
+  lv_obj_center(l);
+  lv_obj_add_event_cb(b, settings_btn_cb, LV_EVENT_PRESSED, (void *)(intptr_t)code);
+}
+
+static void build_settings(lv_obj_t *t) {
+  make_label(t, &ui_font_s, COL_GREY, "SETTINGS", -165);
+  make_label(t, &ui_font_s, COL_GREY, "BRIGHTNESS", -118);
+  make_btn(t, "-", -135, -62, 0);
+  lbl_bright = make_label(t, &ui_font_m, COL_WHITE, "100%", -62);
+  make_btn(t, "+", 135, -62, 1);
+  make_label(t, &ui_font_s, COL_GREY, "SCREEN OFF AFTER", 0);
+  make_btn(t, "-", -135, 56, 2);
+  lbl_tmo = make_label(t, &ui_font_m, COL_WHITE, "60 s", 56);
+  make_btn(t, "+", 135, 56, 3);
+  make_label(t, &ui_font_s, COL_GREY, "Touch wakes the screen", 128);
+}
+
 // ---------------------------------------------------------------- periodic refresh (LVGL task, lock held)
 static void update_face(const ui_data_t *d) {
   static const char *wd[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -262,7 +329,8 @@ static void ui_timer_cb(lv_timer_t *t) {
   xSemaphoreGive(g_mux);
   if (s_page == 0) update_face(&d);       // only the visible tile is refreshed (saves CPU / redraws)
   else if (s_page == 1) update_vitals(&d);
-  else update_system(&d);
+  else if (s_page == 2) update_system(&d);
+  else update_settings();
 }
 
 // ---------------------------------------------------------------- creation
@@ -286,22 +354,25 @@ void ui_create(void) {
 
   lv_obj_t *t0 = lv_tileview_add_tile(tv, 0, 0, LV_DIR_RIGHT);
   lv_obj_t *t1 = lv_tileview_add_tile(tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-  lv_obj_t *t2 = lv_tileview_add_tile(tv, 2, 0, LV_DIR_LEFT);
-  lv_obj_t *tiles[3] = {t0, t1, t2};
-  for (int i = 0; i < 3; i++) {
+  lv_obj_t *t2 = lv_tileview_add_tile(tv, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+  lv_obj_t *t3 = lv_tileview_add_tile(tv, 3, 0, LV_DIR_LEFT);
+  lv_obj_t *tiles[NUM_PAGES] = {t0, t1, t2, t3};
+  for (int i = 0; i < NUM_PAGES; i++) {
     lv_obj_set_user_data(tiles[i], (void *)(intptr_t)i);
     lv_obj_set_style_bg_opa(tiles[i], LV_OPA_TRANSP, 0);
   }
   build_face(t0);
   build_vitals(t1);
   build_system(t2);
+  build_settings(t3);
+  update_settings();
 
   // page dots live on the top layer so they do not scroll with the tiles
   lv_obj_t *dotrow = lv_obj_create(lv_layer_top());
   style_plain(dotrow);
-  lv_obj_set_size(dotrow, 60, 12);
+  lv_obj_set_size(dotrow, 84, 12);
   lv_obj_align(dotrow, LV_ALIGN_BOTTOM_MID, 0, -14);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NUM_PAGES; i++) {
     dots[i] = lv_obj_create(dotrow);
     style_plain(dots[i]);
     lv_obj_set_size(dots[i], 8, 8);

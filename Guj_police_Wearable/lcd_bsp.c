@@ -38,10 +38,77 @@ static const sh8601_lcd_init_cmd_t co5300_lcd_init_cmds[] =
 };
 
 
+// ---------------------------------------------------------------- screen power / brightness
+// Every panel command is sent from the LVGL task (lv_timer below), so it never interleaves with a pixel transfer.
+#define LCD_OPCODE_WRITE_CMD_  0x02
+static esp_lcd_panel_io_handle_t s_io = NULL;
+static esp_lcd_panel_handle_t s_panel = NULL;
+static volatile int s_bright_pct = 100;
+static volatile int s_timeout_s = 60;
+static volatile bool s_screen_on = true;
+static volatile bool s_req_wake = false, s_bright_dirty = true;
+static volatile bool s_swallow_touch = false;
+static volatile unsigned int s_settings_ver = 0;
+
+void lcd_set_brightness(int pct) { if (pct < 10) pct = 10; if (pct > 100) pct = 100; if (pct != s_bright_pct) { s_bright_pct = pct; s_bright_dirty = true; s_settings_ver++; } }
+int  lcd_get_brightness(void) { return s_bright_pct; }
+void lcd_set_screen_timeout(int sec) { if (sec < 0) sec = 0; if (sec > 3600) sec = 3600; if (sec != s_timeout_s) { s_timeout_s = sec; s_settings_ver++; } }
+int  lcd_get_screen_timeout(void) { return s_timeout_s; }
+void lcd_screen_wake(void) { s_req_wake = true; }
+bool lcd_screen_is_on(void) { return s_screen_on; }
+unsigned int lcd_settings_version(void) { return s_settings_ver; }
+
+static void panel_apply_brightness(void)
+{
+  if (s_io == NULL) return;
+  uint8_t v = (uint8_t)((s_bright_pct * 255 + 50) / 100);
+  esp_lcd_panel_io_tx_param(s_io, (LCD_OPCODE_WRITE_CMD_ << 24) | (0x51 << 8), &v, 1);   // 0x51 = write display brightness
+}
+
+static void screen_set(bool on)
+{
+  if (on == s_screen_on || s_panel == NULL) return;
+  if (on)
+  {
+    s_screen_on = true;
+    lv_obj_invalidate(lv_scr_act());
+    lv_obj_invalidate(lv_layer_top());
+    esp_lcd_panel_disp_on_off(s_panel, true);
+    panel_apply_brightness();
+    lv_disp_trig_activity(NULL);                  // restart the idle timer
+  }
+  else
+  {
+    esp_lcd_panel_disp_on_off(s_panel, false);    // AMOLED: no light, almost no power; frame memory is kept
+    s_screen_on = false;
+  }
+  s_settings_ver++;
+}
+
+static void screen_timer_cb(lv_timer_t *t)        // LVGL task, every 100 ms
+{
+  (void)t;
+  if (s_req_wake) { s_req_wake = false; screen_set(true); }
+  if (s_bright_dirty) { s_bright_dirty = false; if (s_screen_on) panel_apply_brightness(); }
+  if (s_screen_on && s_timeout_s > 0 && lv_disp_get_inactive_time(NULL) >= (uint32_t)s_timeout_s * 1000UL) screen_set(false);
+}
+
 static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
   uint16_t tp_x, tp_y;
-  if (touch_read(&tp_x, &tp_y))
+  bool touched = touch_read(&tp_x, &tp_y);
+  if (!s_screen_on)                               // screen off: a touch only wakes it, LVGL sees nothing
+  {
+    if (touched) { s_req_wake = true; s_swallow_touch = true; }
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
+  if (s_swallow_touch)                            // ignore the rest of the touch that woke the screen
+  {
+    if (touched) { data->state = LV_INDEV_STATE_RELEASED; return; }
+    s_swallow_touch = false;
+  }
+  if (touched)
   {
     data->point.x = tp_x;   // raw panel coords: LVGL applies the display rotation itself
     data->point.y = tp_y;
@@ -94,6 +161,8 @@ void lcd_lvgl_Init(void)
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_reset(panel_handle));
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_init(panel_handle));
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(panel_handle, true));
+  s_io = io_handle;
+  s_panel = panel_handle;
 
   lv_init();
   lv_color_t *buf1 = heap_caps_malloc(EXAMPLE_LCD_H_RES * EXAMPLE_LVGL_BUF_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_DMA);
@@ -125,6 +194,7 @@ void lcd_lvgl_Init(void)
   indev_drv.scroll_throw = TOUCH_SCROLL_THROW;
   lv_indev_t *indev = lv_indev_drv_register(&indev_drv);
   if (indev && indev->driver && indev->driver->read_timer) lv_timer_set_period(indev->driver->read_timer, 10);
+  lv_timer_create(screen_timer_cb, 100, NULL);
 
   const esp_timer_create_args_t lvgl_tick_timer_args = 
   {
@@ -196,6 +266,7 @@ static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, 
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
   esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
+  if (!s_screen_on) { lv_disp_flush_ready(drv); return; }        // screen off: skip the transfer (saves power and SPI time)
   const int offsetx1 = (READ_LCD_ID == SH8601_ID) ? area->x1 : area->x1 + 0x06;
   const int offsetx2 = (READ_LCD_ID == SH8601_ID) ? area->x2 : area->x2 + 0x06;
   const int offsety1 = area->y1;

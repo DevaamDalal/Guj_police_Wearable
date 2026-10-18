@@ -3,8 +3,8 @@
 Health-monitoring wearable firmware: heart rate, SpO2, skin temperature and motion, shown on a local AMOLED
 touchscreen, logged to an SD card, and (later) sent over BLE.
 
-**Last updated:** 2026-10-16 · **Firmware stage:** 7 v0 (= stage 6 v0 BLE + offline buffer, charging bolt, boot cleanups) ·
-**Next:** phone time sync over BLE (answered by the CSE team 2026-10-18), then UI polish (Step F) and power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
+**Last updated:** 2026-10-18 · **Firmware stage:** 7 v2 (= stage 7 v1 phone time sync / ISO time on every packet / CHG and BatV + screen timeout and brightness settings page + SD event log SYSLOG.TXT) ·
+**Next:** test stage 7 v2 on the watch (time sync with nRF Connect, screen settings, SYSLOG.TXT), then power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
 **Focus for now:** whole-device functionality first. Sensor tuning and calibration come later, one topic per chat.
 
 ---
@@ -121,11 +121,12 @@ Open the Serial Monitor **before** pressing reset to see the whole boot text. Th
 
 ## 5. Using it
 
-### Screens (swipe left / right; three dots at the bottom show the page)
+### Screens (swipe left / right; four dots at the bottom show the page)
 1. **Watch face:** time (RTC), date, seconds ring, battery icon and %, small HR / SpO2 line.
 2. **Vitals:** large HR, SpO2, skin temperature, status (OK / WARMUP / NO_CONTACT / MOTION / IMU_MOTION). The ring is
    green when OK, grey for no contact / starting, amber otherwise.
 3. **System:** accel, gyro, IR/RED DC, last touch, battery (V and ~%), SD file name and row count, RTC time.
+4. **Settings:** brightness (10-100 %, buttons - and +) and "screen off after" (15 s, 30 s, 1 min, 2 min, 5 min, Never). Values are saved in the watch. A touch wakes a sleeping screen (that touch is not passed on to the UI); while the screen is off the display is switched off and no pixels are sent.
 Only the visible screen is refreshed. The screen stays black where nothing is drawn (AMOLED pixels off).
 The battery % is a voltage estimate and reads high on USB / while charging.
 
@@ -146,6 +147,12 @@ Known cosmetic bug: "value changes/s" prints 0.0 with the gate on (it compares c
 Same `key=value` line as before, once per second when the signal is valid, plus status lines.
 `TOUCH x y` is printed on each press (set `TOUCH_SERIAL_DEBUG 0` in `touch_bsp.h` to silence).
 At boot you also get two heap lines (free memory after display, after SD).
+
+### Event log for diagnostics: `SYSLOG.TXT` on the SD card
+One line per event, appended across all boots: `<RTC time>,<ms since boot>,<TAG>,<text>`. Tags: `BOOT` (firmware, build, reset reason such as PANIC or BROWNOUT, display, touch, clock state, battery, heap, settings), `CLOCK`, `TIME` (every TIME message: accepted or ignored and why), `AUTH` (match or no match, never the token), `BLE` (app connected / disconnected), `REPLAY` (started / paused / done with counts), `CHG` (charging started / stopped with VBAT), `BATT` (level fell through 20 / 10 / 5 %), `SCREEN` (on / off, brightness, timeout), `STATUS` (every 60 s: battery, charging, BLE, stored bytes, free / minimum free / largest memory block, screen, clock state), `ERR`. Capped at 8 MB. The normal data log `LOGnnnn.TXT` is unchanged (plus a `# TIME SYNC` line on a phone sync).
+
+### Serial commands (Serial Monitor, 115200, "Newline" selected; `F` needs no Enter)
+`?` status and command list | `F` FIFO diagnostic | `T2026-10-18 15:30:00` set the clock | `B70` brightness 70 % | `O30` screen off after 30 s (`O0` = never) | `W` wake the screen | `U` mark the clock "not synced" (to test the phone time sync again) | `A<token>` set the AUTH token (bare `A` clears it).
 
 ### Setting the clock
 On first run (or if the RTC lost power / is behind the build time) it is set to the firmware build time.
@@ -177,6 +184,7 @@ accX=,accY=,accZ=,accMag=,accMagF=,gMagF=,gX=,gY=,gZ=,ST=,Q=
 | 2026-10-13 | Stage 4b: FIFO diagnostic (2 runs, finger on sensor) | **loop passes/s 195, new sensor samples/s 25, empty-FIFO passes 90 %, no overflow, max backlog 1.** So about 7.8 of every 8 passes fed stale data into the HR/SpO2 algorithm. The v14 firmware did the same (`maxDataReady` was set by the interrupt but never used to gate), so the algorithm constants were tuned on this behaviour. SD did not mount on this boot (no error text was available). |
 | 2026-10-13 | Stage 4c: new-sample gate | Algorithm now runs only when the FIFO has a new sample (`MAX_GATE_NEW_SAMPLE`, set 0 to revert). `SPO2_MIN_WINDOW_SAMPLES` 18 to 50 under the gate. **Needs on-device comparison.** |
 | 2026-10-13 | Stage 4c on device | Gate works: loop 224 passes/s, **25.0 samples/s fed to the algorithm**, 25 new/s, SD saved `DIAG0001/2.CSV`. HR 63-81, SpO2 84-100 % (spread 3.7). Pulse about 0.26-1 % of DC with strong slow drift (breadboard/finger). Touch OK after boot (check at boot reported not found once). |
+| 2026-10-18 | CSE reply | App will write `AUTH:<token>` then `TIME:<epoch>,<offset>` after connect; server stores BUF=1 under TS; app uses CHG and BatV. Built as stage 7 v1 (not tested on the watch yet). |
 | 2026-10-17 | Stage 7 v0 | Offline buffer replays after reconnect; charging bolt appears when USB is plugged in. Verified by Devaam. |
 | 2026-10-16 | Stage 6 v0 | Out-of-range test passed: the app reconnects after walking out of range and back. |
 | 2026-10-15 | Stage 6 v0 (BLE) on device | Compiles with 16M partition. Advertises, **connects to the real Spandan app, reconnects automatically after reboot**. Packets 95-99 chars, 1 per second, `HR=--`/`SpO2=--` when no value. Heap: after display 152,828 free (largest DMA 102,388); after SD 125,952 (77,812); **after BLE 50,636 free, largest block 31,732**. nRF Connect test skipped, out-of-range reconnect pending. |
@@ -235,8 +243,11 @@ Implemented (`MAX_GATE_NEW_SAMPLE`). Detailed sensor tuning is deliberately post
 ### Step D: BLE (BUILT, connected to the real app 2026-10-15; out-of-range reconnect and heap margin still to check)
 Implemented: `USE_BLE 1`; name `SVNIT_CRL_60` (set `BLE_DEVICE_NAME`; the app registers this name on the server, keep the `SVNIT_CRL_` prefix); service `4fafc201-1fb5-459e-8fcc-c5c9c331914b`, characteristic `beb5483e-36e1-4688-b7f5-ea07361b26a8`
 (NOTIFY only); MTU 517 requested; advertises the service UUID, re-advertises after a disconnect; one packet per second even without contact
-(`--` for missing values); `BT waiting` / `BT connected` on the watch face. Packet (about 110-130 characters):
-`HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,accX=..,accY=..,accZ=..,gX=..,gY=..,gZ=..,ST=OK`
+(`--` for missing values); `BT waiting` / `BT connected` on the watch face. Packet (about 140-175 characters, stage 7 v1):
+`HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,BatV=4.19,CHG=0,accX=..,accY=..,accZ=..,gX=..,gY=..,gZ=..,ST=OK,TS=2026-10-18T12:12:00+05:30`
+`TS` is the watch clock plus the phone's timezone (default +05:30 until the phone sends one). `TSQ=0` is added while the watch clock has not been synced (it may be wrong). `CHG` = 1 while charging (estimate), `BatV` = measured battery-side voltage. Stored packets sent after a reconnect end with `,BUF=1`.
+Messages the app can write (characteristic now has WRITE and WRITE without response): `AUTH:<token>` then `TIME:<unix epoch seconds UTC>,<timezone offset minutes>` (e.g. `TIME:1792305720,330`). The watch sets its RTC and remembers the timezone. It accepts TIME when AUTH matched (`BLE_AUTH_TOKEN` at the top of the .ino; **empty until the CSE team gives the token**, so for now TIME is accepted only while the clock is not trusted, i.e. after the RTC lost power or was set from the build time) or when the clock is unset. Trust and timezone are kept across reboots. Serial prints `BLE: clock set from phone: old -> new`; the SD log gets a `# TIME SYNC` line. The system page shows `(not synced)` after the time until it is set.
+Manual test with nRF Connect: connect, open the characteristic, write the text `TIME:<epoch>,330` (as text, UTF-8); the Serial log should show the clock change.
 Serial prints `BLE TX (n chars): ...` for each packet, plus `BLE: client connected / disconnected`, and a `heap after BLE` line at boot.
 
 Test procedure: (1) set the partition scheme to 16M, flash, check the Serial shows `BLE advertising as SVNIT_CRL_16` and the heap line.
@@ -249,18 +260,17 @@ App requirements (CSE team reply, 2026-10-12): keep name `SVNIT_CRL_XXX` (regist
 to the server (IMU values feed their AI models). 1 Hz, keep under about 200 characters. No bonding. A `DISCONNECT` / `SHUTDOWN` packet means clean shutdown
 (not sent yet, there is no shutdown path). JSON or binary is welcome later, added alongside the old format. Open question for the team: should raw `FIFO_IR/FIFO_RED` also be sent?
 
-### Step E: Offline buffering ("blackout buffer") (BUILT in stage 7 v0, verified on the watch 2026-10-17)
+### Step E: Offline buffering ("blackout buffer") (BUILT in stage 7 v0, verified on the watch 2026-10-17; stage 7 v1 puts the timestamp in every packet)
 While no app is connected, the 1 Hz packet is appended to `BLEBUF.TXT` on the SD card (one line per packet) with two extra keys:
 `TS=2026-10-16T15:30:00` (RTC time, `--` if the RTC is invalid) and `BUF=1` (marks a stored packet). About 3 s after the app reconnects, stored packets
 are sent oldest first, 10 per second, next to the live 1 Hz packets. When the file is empty it is deleted. If the link drops during a replay it pauses and
 resumes at the next unsent line. A leftover `BLEBUF.TXT` after a reboot is replayed on the next connection (a packet in flight at the moment of a power cut may repeat or be skipped).
 Limit 20 MB (about 2 days at 1 Hz), then new packets are dropped. All file work is in the SD writer task, so the sensor loop never waits on the card.
 The system page shows `buf N` (estimated stored packets) while data is waiting. The app and server must tolerate `TS` / `BUF` (extra keys are forwarded to the server per the CSE reply): **ask the CSE team** that replayed `BUF=1` packets are stored with their `TS` and not shown as live.
-Verified on the watch 2026-10-17 (SD logs LOG0015/16): stored packets arrive in a burst right after reconnect. CSE reply 2026-10-18: the app keeps `BUF=1` out of the live screen and the server stores them under their `TS`; wants ISO time with timezone (or epoch) and `TS` on live packets too (planned for stage 7 v1).
+Verified on the watch 2026-10-17 (SD logs LOG0015/16): stored packets arrive in a burst right after reconnect. CSE reply 2026-10-18: the app keeps `BUF=1` out of the live screen and the server stores them under their `TS`; they want ISO time with timezone (or epoch) and `TS` on live packets too (done in stage 7 v1); keep 50-100 ms between replayed packets (it is 100 ms).
 
 ### Step F: UI polish
-Done: watch face, vitals, system page, swipe navigation. Remaining: Bluetooth status icon, brightness / screen timeout
-(AMOLED burn-in and battery), SD and contact icons.
+Done: watch face, vitals, system page, swipe navigation, Bluetooth status, **settings page with brightness and screen timeout (stage 7 v2, needs a test on the watch)**. Remaining: SD and contact icons, wake on wrist raise (IMU).
 
 ### Step G: Power
 Display off/dim, lower CPU frequency, log rate options, sleep behaviour; verify GPIO42 polarity before using it.

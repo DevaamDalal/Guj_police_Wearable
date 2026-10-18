@@ -17,11 +17,14 @@
 #include "rtc_bsp.h"
 #include "sdlog_bsp.h"
 #include <time.h>
+#include <Preferences.h>
+#include <stdarg.h>
+#include "esp_system.h"
 #include "esp_heap_caps.h"
 
 // Device name seen by the app (it registers this name on the server). Keep the SVNIT_CRL_ prefix; change the number per watch.
 #define BLE_DEVICE_NAME "SVNIT_CRL_60"
-#define FW_LABEL        "stage 7 v0 (BLE + offline buffer)"
+#define FW_LABEL        "stage 7 v2 (BLE + offline buffer + time sync + screen settings + event log)"
 #define USE_BLE 1   // 1 = BLE on (stage 5). 0 = local only. BLE needs the 16M partition scheme (see README).
 #if USE_BLE
 #include <BLEDevice.h>
@@ -44,6 +47,18 @@
 #define QMI8658_ADDR   0x6B // Default I2C address for onboard QMI8658
 #define MLX90614_ADDR  0x5A
 
+// ───────────── Clock trust + timezone (set by the phone over BLE or by the Serial T command) ─────────────
+#define DEFAULT_TZ_OFFSET_MIN 330        // IST; replaced by the phone's offset whenever it sends TIME
+// Token the app sends as AUTH:<token> right after connecting. With a matching token the watch always accepts TIME.
+// Left empty = no token configured: TIME is then accepted only while the clock is not trusted (RTC reset / set from build time).
+#define BLE_AUTH_TOKEN   ""
+// The token can also be set without rebuilding: Serial command  A<token>  (saved in the watch); a bare  A  clears it.
+char authToken[64] = BLE_AUTH_TOKEN;
+Preferences prefs;
+int  tzOffsetMin   = DEFAULT_TZ_OFFSET_MIN;
+bool clockTrusted  = false;              // true once the time came from the phone or the Serial T command
+static void setClockTrusted(bool v) { clockTrusted = v; prefs.putBool("clkok", v); }
+
 #if USE_BLE
 // ─────────────────────── BLE UUIDs ──────────────────────────
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -53,8 +68,26 @@ BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
 volatile uint32_t bleConnectedMs = 0;   // when the app last connected (replay waits a few seconds for it to subscribe)
 
+#define BLE_RX_SLOTS 4
+static char bleRx[BLE_RX_SLOTS][64];                // messages written by the app (AUTH:..., TIME:...), handled in loop()
+static volatile uint8_t bleRxHead = 0, bleRxTail = 0;
+static volatile bool bleAuthOk = false;             // AUTH matched during this connection
+
+class MyCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) {              // runs in the BLE task: only copy, no I2C here
+    auto v = c->getValue();
+    size_t len = v.length();
+    if (len == 0 || len >= sizeof(bleRx[0])) return;
+    uint8_t h = bleRxHead, nh = (uint8_t)((h + 1) % BLE_RX_SLOTS);
+    if (nh == bleRxTail) return;                    // queue full: drop
+    memcpy(bleRx[h], v.c_str(), len);
+    bleRx[h][len] = '\0';
+    bleRxHead = nh;
+  }
+};
+
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) { deviceConnected = true; bleConnectedMs = millis(); Serial.println("BLE: client connected"); }
+  void onConnect(BLEServer *pServer) { deviceConnected = true; bleConnectedMs = millis(); bleAuthOk = false; bleRxTail = bleRxHead; Serial.println("BLE: client connected"); }
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
     Serial.println("BLE: client disconnected, advertising again");
@@ -201,7 +234,21 @@ RtcTime rtcNow = {2000, 1, 1, 0, 0, 0};          // last RTC reading (for the wa
 bool rtcOk = false;
 float battV = 0;
 int battPct = -1;
+bool bootTouchOk = false; int bootTouchTries = 0;   // touch check result at boot (logged once the SD card is up)
 bool battCharging = false;   // estimate from the voltage trend (this board has no charge-status signal we read)
+
+// Event log (SD card, SYSLOG.TXT, kept across boots): one line per event:  <RTC time>,<ms since boot>,<TAG>,<text>
+// Tags: BOOT CLOCK BLE AUTH TIME REPLAY BUFFER CHG BATT SCREEN TOUCH SD STATUS ERR
+static void evt(const char *tag, const char *fmt, ...) {
+  char body[190];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+  char line[SDLOG_LINE_MAX];
+  snprintf(line, sizeof(line), "%s,%lu,%s,%s", rtcOk ? rtcStr : "no-rtc", (unsigned long)millis(), tag, body);
+  sdlog_event(line);
+}
 
 void writeReg(uint8_t reg, uint8_t val) {
   I2Cbus.beginTransmission(MAX30102_ADDR);
@@ -555,6 +602,7 @@ static void rtcSyncFromBuild() {
   RtcTime now;
   if (!rtc_get(&now) || rtcToEpoch(now) < rtcToEpoch(b)) {
     Serial.println(rtc_set(&b) ? "RTC set from build time (send T<YYYY-MM-DD HH:MM:SS> to correct)" : "RTC write FAILED");
+    setClockTrusted(false);                       // build time is only a placeholder; the phone should fix it
   } else {
     Serial.println("RTC valid");
   }
@@ -665,7 +713,7 @@ static void diagService() {
 }
 
 static void pollSerialCmd() {
-  static char buf[40];
+  static char buf[80];
   static int n = 0;
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -677,11 +725,42 @@ static void pollSerialCmd() {
           int y, mo, d, h, mi, s;
           if (sscanf(buf + 1, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
             RtcTime t = { y, mo, d, h, mi, s };
-            Serial.println(rtc_set(&t) ? "RTC set" : "RTC set FAILED");
+            char before[24];
+            strncpy(before, rtcStr, sizeof(before) - 1); before[sizeof(before) - 1] = '\0';
+            bool ok = rtc_set(&t);
+            Serial.println(ok ? "RTC set" : "RTC set FAILED");
+            if (ok) setClockTrusted(true);
             updateRtcStr();
+            if (ok) evt("CLOCK", "set by Serial T command: %s -> %s, now trusted", before, rtcStr);
+            else evt("ERR", "Serial T command: RTC write failed");
           } else Serial.println("Use: T2026-10-10 13:20:11");
         } else if (buf[0] == 'F') {
           diagStart();
+        } else if (buf[0] == 'B') {                      // B70 = brightness 70 %
+          lcd_set_brightness(atoi(buf + 1));
+          Serial.printf("brightness %d%%\n", lcd_get_brightness());
+        } else if (buf[0] == 'O') {                      // O30 = screen off after 30 s, O0 = never
+          lcd_set_screen_timeout(atoi(buf + 1));
+          Serial.printf("screen off after %d s (0 = never)\n", lcd_get_screen_timeout());
+        } else if (buf[0] == 'W') {                      // W = wake the screen
+          lcd_screen_wake();
+          Serial.println("screen wake requested");
+        } else if (buf[0] == 'U') {                      // U = mark the clock "not synced" (to test the phone time sync again)
+          setClockTrusted(false);
+          Serial.println("clock marked NOT synced: the next TIME from the phone will be accepted");
+          evt("CLOCK", "marked not synced (Serial U command)");
+        } else if (buf[0] == 'A') {                      // A<token> = set the AUTH token, bare A = clear it
+          strncpy(authToken, buf + 1, sizeof(authToken) - 1);
+          authToken[sizeof(authToken) - 1] = '\0';
+          prefs.putString("auth", authToken);
+          Serial.printf("AUTH token %s (%u chars)\n", authToken[0] ? "set" : "cleared", (unsigned)strlen(authToken));
+          evt("AUTH", "token %s via Serial (%u chars)", authToken[0] ? "set" : "cleared", (unsigned)strlen(authToken));
+        } else if (buf[0] == '?') {                      // ? = status and command list
+          unsigned long by, dr; sdlog_buf_info(&by, &dr);
+          Serial.printf("clock %s | tz UTC%+d min | AUTH token %s | brightness %d%% | screen off after %d s | screen %s | buffer %lu bytes\n",
+                        clockTrusted ? "synced" : "NOT synced", tzOffsetMin, authToken[0] ? "set" : "not set",
+                        lcd_get_brightness(), lcd_get_screen_timeout(), lcd_screen_is_on() ? "on" : "off", by);
+          Serial.println("Commands: F diagnostic | T2026-10-18 15:30:00 set clock | B70 brightness | O30 screen timeout s (O0 never) | W wake | U clock not synced | A<token> set AUTH token | ? this list");
         }
         n = 0;
       }
@@ -720,17 +799,31 @@ static void logPush() {
 // ───────────── BLE packet (1 Hz) ─────────────
 // App contract (CSE team): Key=Value pairs separated by commas; it reads HR, SpO2, Temp, Batt; other keys are forwarded to the
 // server. "--" = no reading. Keep under ~200 characters. The SD log and Serial keep the long line.
+static bool isoNow(char *out, size_t n) {            // 2026-10-18T12:12:00+05:30 (watch clock + phone timezone)
+  if (!rtcOk) { out[0] = '\0'; return false; }
+  int off = tzOffsetMin, a = off < 0 ? -off : off;
+  snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d", rtcNow.year, rtcNow.month, rtcNow.day,
+           rtcNow.hour, rtcNow.min, rtcNow.sec, off < 0 ? '-' : '+', a / 60, a % 60);
+  return true;
+}
 static int bleBuildPacket(char *out, size_t n) {
   uint32_t now = millis();
   bool hrShow = hrValid || (lastDisplayedHR > 0 && (now - lastGoodHRMs) <= HR_HOLD_AFTER_IMU_MS);
-  char hrS[12], spS[12], bS[8];
+  char hrS[12], spS[12], bS[8], bvS[10];
   if (hrShow) snprintf(hrS, sizeof(hrS), "%.1f", hrValid ? heartRate : lastDisplayedHR); else strcpy(hrS, "--");
   if (spo2Valid && spO2 > 0) snprintf(spS, sizeof(spS), "%.1f", spO2); else strcpy(spS, "--");
-  if (battPct >= 0) snprintf(bS, sizeof(bS), "%d", battPct); else strcpy(bS, "--");
-  return snprintf(out, n,
-    "HR=%s,SpO2=%s,Temp=%.1f,Batt=%s,accX=%.3f,accY=%.3f,accZ=%.3f,gX=%.1f,gY=%.1f,gZ=%.1f,ST=%s",
-    hrS, spS, mlxObjectTemp, bS, accX, accY, accZ, gyroX, gyroY, gyroZ,
+  if (battPct >= 0) { snprintf(bS, sizeof(bS), "%d", battPct); snprintf(bvS, sizeof(bvS), "%.2f", battV); }
+  else { strcpy(bS, "--"); strcpy(bvS, "--"); }
+  int len = snprintf(out, n,
+    "HR=%s,SpO2=%s,Temp=%.1f,Batt=%s,BatV=%s,CHG=%d,accX=%.3f,accY=%.3f,accZ=%.3f,gX=%.1f,gY=%.1f,gZ=%.1f,ST=%s",
+    hrS, spS, mlxObjectTemp, bS, bvS, battCharging ? 1 : 0, accX, accY, accZ, gyroX, gyroY, gyroZ,
     gyroMotion ? "IMU_MOTION" : statusMsg);
+  if (len <= 0 || len >= (int)n - 50) return len;
+  char ts[32];
+  if (isoNow(ts, sizeof(ts))) {                       // TS = time of this reading; TSQ=0 = watch clock not synced yet (may be wrong)
+    len += snprintf(out + len, n - len, ",TS=%s%s", ts, clockTrusted ? "" : ",TSQ=0");
+  }
+  return len;
 }
 static void bleNotify() {
 #if USE_BLE
@@ -743,11 +836,8 @@ static void bleNotify() {
     // No app connected: keep the packet on the SD card (with its time) so it can be replayed after reconnect.
     if (!sdlog_active()) return;
     int n = bleBuildPacket(pkt, sizeof(pkt));
-    if (n <= 0 || n > 150) return;
-    char ts[24];
-    if (rtcOk) snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02d", rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec);
-    else strcpy(ts, "--");
-    snprintf(pkt + n, sizeof(pkt) - n, ",TS=%s,BUF=1", ts);
+    if (n <= 0 || n > 185) return;
+    snprintf(pkt + n, sizeof(pkt) - n, ",BUF=1");   // the packet already carries its own TS
     if (!sdlog_buf_append(pkt)) Serial.println("BLE buffer: queue full, packet dropped");
     return;
   }
@@ -767,12 +857,16 @@ static void bleReplayService() {
   static uint32_t last = 0, sent = 0;
   uint32_t now = millis();
   if (!deviceConnected) {                         // link lost: pause (the next line to send stays in the file)
-    if (on && sdlog_buf_replay(false)) { on = false; Serial.printf("BLE replay paused after %lu packets\n", (unsigned long)sent); }
+    if (on && sdlog_buf_replay(false)) { on = false; Serial.printf("BLE replay paused after %lu packets\n", (unsigned long)sent); evt("REPLAY", "paused (link lost) after %lu packets", (unsigned long)sent); }
     return;
   }
   if (!on) {
     if (!sdlog_buf_pending() || now - bleConnectedMs < 3000) return;   // give the app 3 s to subscribe first
-    if (sdlog_buf_replay(true)) { on = true; sent = 0; Serial.println("BLE replay: sending stored packets"); }
+    if (sdlog_buf_replay(true)) {
+      unsigned long by, dr; sdlog_buf_info(&by, &dr);
+      on = true; sent = 0; Serial.println("BLE replay: sending stored packets");
+      evt("REPLAY", "started, about %lu stored packets (%lu bytes), %lu dropped so far", by / 130UL, by, dr);
+    }
     return;
   }
   if (now - last < 100) return;
@@ -789,8 +883,128 @@ static void bleReplayService() {
   } else if (r < 0) {
     on = false;
     Serial.printf("BLE replay done: %lu stored packets sent\n", (unsigned long)sent);
+    evt("REPLAY", "done, %lu stored packets sent", (unsigned long)sent);
   }
 #endif
+}
+
+// Messages written by the app. AUTH:<token> then TIME:<unix epoch seconds UTC>,<timezone offset in minutes>.
+static void bleHandleMessage(char *msg) {
+#if USE_BLE
+  size_t L = strlen(msg);
+  while (L > 0 && (msg[L - 1] == '\n' || msg[L - 1] == '\r' || msg[L - 1] == ' ')) msg[--L] = '\0';
+  if (strncmp(msg, "AUTH:", 5) == 0) {
+    const char *tok = msg + 5;
+    if (authToken[0] == '\0') { bleAuthOk = false; Serial.println("BLE: AUTH received (no token configured on the watch)"); evt("AUTH", "received, %u chars, NO token configured on the watch", (unsigned)strlen(tok)); }
+    else { bleAuthOk = (strcmp(tok, authToken) == 0); Serial.println(bleAuthOk ? "BLE: AUTH accepted" : "BLE: AUTH rejected"); evt("AUTH", "received, %u chars, %s", (unsigned)strlen(tok), bleAuthOk ? "MATCH" : "NO MATCH"); }
+  } else if (strncmp(msg, "TIME:", 5) == 0) {
+    long long epoch = 0; int off = 0;
+    if (sscanf(msg + 5, "%lld,%d", &epoch, &off) != 2 || epoch < 1700000000LL || epoch > 2500000000LL || off < -720 || off > 840) {
+      Serial.printf("BLE: TIME ignored (bad format or range): %s\n", msg);
+      evt("TIME", "IGNORED bad format or range: %s", msg);
+      return;
+    }
+    bool unset = !rtcOk || !clockTrusted;
+    if (!bleAuthOk && !unset) { Serial.println("BLE: TIME ignored (clock already trusted and no valid AUTH)"); evt("TIME", "IGNORED clock already trusted and no valid AUTH: %s", msg); return; }
+    time_t local = (time_t)(epoch + (long long)off * 60);
+    struct tm g;
+    gmtime_r(&local, &g);
+    RtcTime t = { g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec };
+    char before[24];
+    strncpy(before, rtcStr, sizeof(before) - 1); before[sizeof(before) - 1] = '\0';
+    if (rtc_set(&t)) {
+      tzOffsetMin = off;
+      prefs.putInt("tz", off);
+      setClockTrusted(true);
+      updateRtcStr();
+      Serial.printf("BLE: clock set from phone: %s -> %s (UTC%+d min)\n", before, rtcStr, off);
+      char note[96];
+      snprintf(note, sizeof(note), "# TIME SYNC from phone: %s -> %s (UTC%+d min)", before, rtcStr, off);
+      sdlog_write(note);
+      evt("TIME", "ACCEPTED %s | clock %s -> %s | UTC%+d min | AUTH=%s", msg, before, rtcStr, off, bleAuthOk ? "yes" : "no (clock was unset)");
+      evt("CLOCK", "set from phone, now trusted");
+    } else { Serial.println("BLE: TIME received but the RTC write failed"); evt("ERR", "TIME received but the RTC write failed: %s", msg); }
+  } else {
+    Serial.printf("BLE: unknown message ignored: %s\n", msg);
+    evt("BLE", "unknown message ignored: %s", msg);
+  }
+#endif
+}
+static void bleRxService() {
+#if USE_BLE
+  while (bleRxTail != bleRxHead) {
+    char msg[64];
+    strncpy(msg, bleRx[bleRxTail], sizeof(msg) - 1); msg[sizeof(msg) - 1] = '\0';
+    bleRxTail = (uint8_t)((bleRxTail + 1) % BLE_RX_SLOTS);
+    bleHandleMessage(msg);
+  }
+#endif
+}
+
+// Writes changes to the SD event log (SYSLOG.TXT) and saves screen settings. Called every loop pass; cheap.
+static const char *resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "reset button / external";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "PANIC (crash)";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "other watchdog";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (supply dipped)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    default:                return "other";
+  }
+}
+static void eventService() {
+  static bool first = true, lastConn = false, lastChg = false, lastScreen = true;
+  static int lastBri = 0, lastTmo = 0, battBand = 100;
+  static unsigned lastVer = 0;
+  static uint32_t lastStatus = 0;
+  uint32_t now = millis();
+  bool conn = false;
+#if USE_BLE
+  conn = deviceConnected;
+#endif
+  if (first) {                                   // baseline: the values loaded at boot are not "changes"
+    first = false;
+    lastConn = conn; lastChg = battCharging; lastScreen = lcd_screen_is_on();
+    lastBri = lcd_get_brightness(); lastTmo = lcd_get_screen_timeout(); lastVer = lcd_settings_version();
+    lastStatus = now;
+    return;
+  }
+  if (conn != lastConn) {
+    lastConn = conn;
+    unsigned long by, dr; sdlog_buf_info(&by, &dr);
+    if (conn) evt("BLE", "app connected, heap free=%u, %lu bytes stored on SD waiting", (unsigned)ESP.getFreeHeap(), by);
+    else      evt("BLE", "app disconnected, advertising again; packets are now stored on SD (%lu bytes already stored)", by);
+  }
+  if (battCharging != lastChg) {
+    lastChg = battCharging;
+    evt("CHG", "%s, VBAT=%.2f V, %d%%", battCharging ? "charging started (estimate)" : "charging stopped (estimate)", battV, battPct);
+  }
+  if (battPct >= 0) {                            // one line each time the level drops through 20 / 10 / 5 %
+    int band = battPct <= 5 ? 5 : battPct <= 10 ? 10 : battPct <= 20 ? 20 : 100;
+    if (band < battBand) evt("BATT", "level fell to %d%% (VBAT=%.2f V)", battPct, battV);
+    if (battPct > 25) battBand = 100; else if (band < battBand) battBand = band;
+  }
+  unsigned ver = lcd_settings_version();
+  if (ver != lastVer) {
+    lastVer = ver;
+    bool scr = lcd_screen_is_on();
+    int bri = lcd_get_brightness(), tmo = lcd_get_screen_timeout();
+    if (scr != lastScreen) { lastScreen = scr; evt("SCREEN", "%s", scr ? "on (touch or request)" : "off (timeout)"); }
+    if (bri != lastBri) { lastBri = bri; prefs.putInt("bri", bri); evt("SCREEN", "brightness set to %d%%", bri); }
+    if (tmo != lastTmo) { lastTmo = tmo; prefs.putInt("tmo", tmo); evt("SCREEN", "timeout set to %d s (0 = never)", tmo); }
+  }
+  if (now - lastStatus >= 60000UL) {             // one status line per minute: the main health picture for diagnostics
+    lastStatus = now;
+    unsigned long by, dr; sdlog_buf_info(&by, &dr);
+    evt("STATUS", "vbat=%.2f pct=%d chg=%d ble=%d buf_bytes=%lu buf_dropped=%lu free=%u minfree=%u largest=%u screen=%d bri=%d tmo=%d clk=%s tz=%+d",
+        battV, battPct, battCharging ? 1 : 0, conn ? 1 : 0, by, dr, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), lcd_screen_is_on() ? 1 : 0, lcd_get_brightness(),
+        lcd_get_screen_timeout(), clockTrusted ? "synced" : "NOT-synced", tzOffsetMin);
+  }
 }
 
 // 2 Hz: clock + battery for the watch face, text lines for the system page.
@@ -810,7 +1024,7 @@ static void infoPush() {
     unsigned long by, dr; sdlog_buf_info(&by, &dr);
     snprintf(l2 + strlen(l2), sizeof(l2) - strlen(l2), " buf %lu", by / 130UL);
   }
-  snprintf(l3, sizeof(l3), "%s", rtcStr);
+  snprintf(l3, sizeof(l3), "%s%s", rtcStr, clockTrusted ? "" : " (not synced)");
   ui_set_info(l1, l2, l3);
   ui_set_clock(rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.min, rtcNow.sec, rtcOk);
   ui_set_battery(battV, battPct, battCharging);
@@ -836,7 +1050,8 @@ void setup() {
   initMLX90614();
   {   // the touch chip can need a moment after power-up: retry a few times before giving up
     bool touchOk = false;
-    for (int i = 0; i < 6 && !touchOk; i++) { touchOk = touch_init(); if (!touchOk) delay(50); }
+    for (int i = 0; i < 6 && !touchOk; i++) { bootTouchTries = i + 1; touchOk = touch_init(); if (!touchOk) delay(50); }
+    bootTouchOk = touchOk;
     Serial.println(touchOk ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38) after 6 tries");
   }
 
@@ -846,12 +1061,23 @@ void setup() {
   Serial.printf("heap after display: free %u, largest DMA block %u\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
+  prefs.begin("spandan", false);
+  tzOffsetMin  = prefs.getInt("tz", DEFAULT_TZ_OFFSET_MIN);
+  clockTrusted = prefs.getBool("clkok", false);
+  {
+    String tok = prefs.getString("auth", BLE_AUTH_TOKEN);
+    strncpy(authToken, tok.c_str(), sizeof(authToken) - 1);
+    authToken[sizeof(authToken) - 1] = '\0';
+    lcd_set_brightness(prefs.getInt("bri", 100));
+    lcd_set_screen_timeout(prefs.getInt("tmo", 60));
+  }
   rtcSyncFromBuild();
+  Serial.printf("clock: %s, timezone UTC%+d min\n", clockTrusted ? "trusted (set by phone or T command)" : "NOT synced yet (waiting for the phone)", tzOffsetMin);
   updateBattery();
   if (sdlog_begin()) {
     char hdr[SDLOG_LINE_MAX];
-    snprintf(hdr, sizeof(hdr), "# SPANDAN log | start RTC=%s | build %s %s | period=%lu ms | VBAT=%.2f",
-             rtcStr, __DATE__, __TIME__, (unsigned long)LOG_PERIOD_MS, battV);
+    snprintf(hdr, sizeof(hdr), "# SPANDAN log | start RTC=%s%s | build %s %s | period=%lu ms | VBAT=%.2f",
+             rtcStr, clockTrusted ? "" : " (clock not synced)", __DATE__, __TIME__, (unsigned long)LOG_PERIOD_MS, battV);
     sdlog_write(hdr);
   } else {
     Serial.printf("SD not available (%s) - continuing without logging\n", sdlog_last_error());
@@ -867,8 +1093,9 @@ void setup() {
   BLEService *pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
   );
+  pCharacteristic->setCallbacks(new MyCharCallbacks());
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
   BLEAdvertising *pAdv = BLEDevice::getAdvertising();
@@ -880,8 +1107,18 @@ void setup() {
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 #endif
 
+  {   // boot report in the SD event log (what a diagnostic needs after an unexpected restart)
+    unsigned long by, dr; sdlog_buf_info(&by, &dr);
+    evt("BOOT", "firmware=%s | build %s %s | name=%s | reset reason: %s", FW_LABEL, __DATE__, __TIME__, BLE_DEVICE_NAME, resetReasonName());
+    evt("BOOT", "display=%s (ID 0x%02X) | touch %s after %d tries | SD %s", lcd_controller_name(), lcd_controller_id(),
+        bootTouchOk ? "OK" : "NOT FOUND", bootTouchTries, sdlog_active() ? "ok" : "off");
+    evt("BOOT", "clock %s | tz UTC%+d min | rtc=%s | battery %.2f V %d%% charging=%d", clockTrusted ? "synced" : "NOT synced", tzOffsetMin, rtcStr, battV, battPct, battCharging ? 1 : 0);
+    evt("BOOT", "settings: brightness %d%%, screen off after %d s, AUTH token %s | %lu bytes of undelivered BLE data on SD", lcd_get_brightness(), lcd_get_screen_timeout(), authToken[0] ? "set" : "NOT set", by);
+    evt("BOOT", "heap free=%u minfree=%u largest internal block=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
   Serial.println("\n" BLE_DEVICE_NAME " READY (ESP32-S3 AMOLED)  firmware: " FW_LABEL ", build " __DATE__ " " __TIME__);
-  Serial.println("Commands: F = 30 s FIFO diagnostic (just press F, then Send), T2026-10-13 15:30:00 = set clock");
+  Serial.println("Commands: F = 30 s FIFO diagnostic (just press F, then Send), T2026-10-13 15:30:00 = set clock (the phone sets it over BLE too), ? = status and all commands");
   Serial.println("Columns: FIFO_IR,FIFO_RED,S1_IR,S1_RED,IR_DC,IR_AC,RED_DC,RED_AC,HR,SpO2,ObjT,AmbT,accX,accY,accZ,gX,gY,gZ,ST");
 }
 
@@ -895,8 +1132,10 @@ void loop() {
   infoPush();
   pollSerialCmd();
   diagService();
+  bleRxService();
   bleNotify();
   bleReplayService();
+  eventService();
   {   // heartbeat every 5 s so the Serial Monitor shows the sketch is alive even without a finger on the sensor
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat >= 5000) {

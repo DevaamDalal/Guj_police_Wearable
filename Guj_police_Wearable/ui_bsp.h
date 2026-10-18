@@ -8,8 +8,16 @@ extern "C" {
 void lcd_lvgl_Init(void);   // display + LVGL task (lcd_bsp.c)
 const char *lcd_controller_name(void);   // "SH8601" or "CO5300" (lcd_bsp.c)
 unsigned char lcd_controller_id(void);
+// Screen power / brightness (lcd_bsp.c). Panel commands run inside the LVGL task; these calls are safe from any task.
+void lcd_set_brightness(int pct);          // 10..100 %
+int  lcd_get_brightness(void);
+void lcd_set_screen_timeout(int seconds);  // 0 = never switch the screen off
+int  lcd_get_screen_timeout(void);
+void lcd_screen_wake(void);                // request: screen on (a touch also wakes it)
+bool lcd_screen_is_on(void);
+unsigned int lcd_settings_version(void);   // increases whenever brightness, timeout or screen on/off changes
 void ui_create(void);       // build the UI; called by lcd_bsp.c with the LVGL lock held
-void ui_show_page(int idx); // 0 = watch face, 1 = vitals, 2 = system (LVGL lock must be held)
+void ui_show_page(int idx); // 0 = watch face, 1 = vitals, 2 = system, 3 = settings (LVGL lock must be held)
 
 // All setters below are thread-safe and non-blocking: call from any task, the LVGL task picks the values up.
 void ui_set_values(float hr, bool hrOk, float spo2, bool spo2Ok,

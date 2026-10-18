@@ -30,6 +30,9 @@
 #define CMD_BUF_APPEND  '\x01'
 #define CMD_RP_START    '\x02'
 #define CMD_RP_STOP     '\x03'
+#define CMD_EVENT       '\x04'
+#define EVENT_PATH      SD_MOUNT "/SYSLOG.TXT"
+#define EVENT_MAX_BYTES (8UL * 1024UL * 1024UL)   // stop adding events after 8 MB
 
 static sdmmc_card_t *s_card = NULL;
 static FILE *s_file = NULL;
@@ -50,6 +53,19 @@ static volatile bool s_rp_on = false;              // replay requested
 static volatile int s_rp_state = 0;                // 0 idle, 1 loop wants a line, 2 line ready, 3 finished
 static char s_rp_line[BUF_LINE_MAX];
 static volatile long s_rp_next = 0;
+
+static FILE *s_ef = NULL;                          // SYSLOG.TXT, append mode
+static unsigned long s_ev_bytes = 0, s_ev_dropped = 0;
+static bool s_ev_dirty = false;
+
+static void eventAppend(const char *text)
+{
+  if (s_ef == NULL) return;
+  if (s_ev_bytes >= EVENT_MAX_BYTES) { s_ev_dropped++; return; }
+  if (fputs(text, s_ef) < 0 || fputc('\n', s_ef) < 0) { s_ev_dropped++; return; }
+  s_ev_bytes += strlen(text) + 1;
+  s_ev_dirty = true;
+}
 
 static void bufAppend(const char *text)
 {
@@ -122,6 +138,7 @@ static void sdlog_task(void *arg)
       if (line[0] == CMD_BUF_APPEND)      bufAppend(line + 1);
       else if (line[0] == CMD_RP_START)   bufReplayStart();
       else if (line[0] == CMD_RP_STOP)    bufReplayStop();
+      else if (line[0] == CMD_EVENT)      eventAppend(line + 1);
       else if (fputs(line, s_file) < 0 || fputc('\n', s_file) < 0) s_state = 2;
       else s_rows++;
     }
@@ -131,6 +148,7 @@ static void sdlog_task(void *arg)
       if (fflush(s_file) != 0) s_state = 2;
       else fsync(fileno(s_file));
       if (s_bf != NULL && s_buf_dirty) { fflush(s_bf); fsync(fileno(s_bf)); s_buf_dirty = false; }
+      if (s_ef != NULL && s_ev_dirty)  { fflush(s_ef); fsync(fileno(s_ef)); s_ev_dirty = false; }
       lastFlush = xTaskGetTickCount();
     }
   }
@@ -141,7 +159,7 @@ bool sdlog_begin(void)
   esp_vfs_fat_sdmmc_mount_config_t mount_config =
   {
     .format_if_mount_failed = false,        // never wipe a card
-    .max_files = 3,
+    .max_files = 5,                         // log + event log + offline buffer + diagnostic capture + spare
     .allocation_unit_size = 16 * 1024,
   };
   spi_bus_config_t bus_cfg =
@@ -189,6 +207,10 @@ bool sdlog_begin(void)
     s_buf_pending = true;
     printf("SD: %lu bytes of undelivered BLE data found in BLEBUF.TXT\n", s_buf_bytes);
   }
+
+  s_ef = fopen(EVENT_PATH, "a");                  // event log; a failure only means no event log
+  if (s_ef != NULL) { fseek(s_ef, 0, SEEK_END); s_ev_bytes = (unsigned long)ftell(s_ef); }
+  else printf("SD: cannot open SYSLOG.TXT (no event log)\n");
 
   s_q = xQueueCreate(SDLOG_QUEUE_LEN, SDLOG_LINE_MAX);
   if (s_q == NULL) { fclose(s_file); s_file = NULL; snprintf(s_err, sizeof(s_err), "log queue allocation failed (RAM)"); return false; }
@@ -282,3 +304,5 @@ int sdlog_buf_replay_get(char *out, size_t n)
 }
 
 void sdlog_buf_info(unsigned long *bytes, unsigned long *dropped) { *bytes = s_buf_bytes; *dropped = s_buf_dropped; }
+
+void sdlog_event(const char *line) { bufSend(CMD_EVENT, line); }

@@ -19,6 +19,9 @@ bool sdlog_aux_open(const char *prefix, const char *ext, char *nameOut, size_t n
 bool sdlog_aux_write(const char *text);          // false on write error
 void sdlog_aux_close(void);
 
+// Event log for diagnostics: one line per event appended to SYSLOG.TXT (kept across boots). Never blocks; dropped if the queue is full.
+void sdlog_event(const char *line);
+
 // Offline buffer ("blackout buffer"): packets that could not be sent over BLE are appended to BLEBUF.TXT (one line each)
 // and replayed, oldest first, after the app reconnects. All file work happens in the SD writer task; these calls never block.
 bool sdlog_buf_append(const char *line);         // queue one line for BLEBUF.TXT; false if the queue is full / no card
