@@ -1,8 +1,8 @@
 # Roadmap & Status — Spandan Wearable
 
-> **Current stage:** 7 v2 (settings + event log + time sync test helpers)
-> **Current tag:** `stage7-v2-settings-eventlog`
-> **Last updated:** 2026-10-18
+> **Current stage:** 7 v3 (status icons + settings touch filter + replay validation)
+> **Current tag:** `stage7-v3-status-icons`
+> **Last updated:** 2026-10-19
 
 ---
 
@@ -15,7 +15,7 @@
 | **C** | New-sample gate for algorithm | ✅ **DONE** | `stage4c-local` | `MAX_GATE_NEW_SAMPLE 1`, SpO2 spread improved |
 | **D** | BLE with Spandan app | ✅ **DONE** | `stage6-v0-ble` | Connects, reconnects, out-of-range test passed (2026-10-16) |
 | **E** | Offline buffering ("blackout buffer") | ✅ **DONE** | `stage7-v0-offline-buffer` | BLEBUF.TXT on SD, replay after reconnect with TS= and BUF=1, verified on device (2026-10-17) |
-| **F** | UI polish & settings | 🟡 **NEARLY DONE** | `stage7-v2-settings-eventlog` | 4th page (settings: brightness 10-100%, screen timeout 15s..Never, NVS persist), screen off & touch wake, BT label, charging bolt. Remaining: SD/contact icons, wake on wrist raise |
+| **F** | UI polish & settings | ✅ **COMPLETE** (pending on-device check) | `stage7-v3-status-icons` | 4th page (brightness, screen timeout, NVS persist), screen off & touch wake, BT label, charging bolt, SD dot (green/grey/red), contact line (CONTACT/NO CONTACT/etc.). Settings buttons act on release with 20px drag filter (#11 fixed). |
 | **G** | Power management | ⬜ **NOT STARTED** | — | Display off/dim (panel DISPOFF in 7v2), lower CPU freq, sleep, verify GPIO42 polarity |
 
 ## Small Cleanups (do with next task)
@@ -45,6 +45,9 @@
 | `8a0b848` | — | repo: Add project docs, AI context, and repo structure |
 | `522c8e1` | `stage7-v0-offline-buffer` | Stage 7 v0: offline BLE buffer on SD, charging bolt, boot cleanups |
 | `577cac1` | `stage7-v2-settings-eventlog` | Stage 7 v2: screen timeout and brightness, SD event log, time sync test helpers |
+| `21ee16d` | — | docs: Update for stage 7 v2 — settings page, SYSLOG.TXT, inbound TIME/AUTH protocol, issues #10 and #11 |
+| `5120944` | — | docs: Update BLE_PROTOCOL.md with verified findings from ExponentialGrowth/bletomp app repo |
+| `a7855fd` | `stage7-v3-status-icons` | Stage 7 v3: status icons (SD, finger contact), settings buttons on release (#11), replay validation, SD queue in PSRAM |
 
 ---
 
@@ -61,7 +64,8 @@
 | 2026-10-15 | Stage 6 v0 | BLE connects to Spandan app, auto-reconnects. Heap: 51 KB free after BLE |
 | 2026-10-16 | Stage 6 v0 | Out-of-range reconnect test passed — Step D fully closed |
 | 2026-10-17 | Stage 7 v0 | Offline buffer replay verified (LOG0015/LOG0016). Charging bolt on watch face confirmed |
-| 2026-10-18 | Stage 7 v2 | Syntax checked with stubs; SD event log & buffer logic host-tested. On-device test pending: settings page, screen off/touch wake, nRF Connect TIME sync, SYSLOG.TXT |
+| 2026-10-18 | Stage 7 v2 | Syntax checked with stubs; SD event log & buffer logic host-tested. Settings page & screen sleep/wake built |
+| 2026-10-19 | Stage 7 v3 | Host-tested with damaged BLEBUF.TXT (22 lines replayed, 3 skipped); watch face rendered headless. Pending on-device verification: SD dot, contact line, settings button drag filter, heap after BLE with PSRAM queue |
 
 ---
 

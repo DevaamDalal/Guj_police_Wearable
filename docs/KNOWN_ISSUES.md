@@ -26,24 +26,17 @@
 **Root cause:** Charging detection is estimated from voltage trend, not from a hardware charge-status signal. The board has no GPIO connected to ETA6098 STAT.
 **Fix planned:** Not urgent. Could be improved with a STAT→GPIO wire (hardware mod).
 
-### #5 — RAM tight after BLE (~51 KB free)
-**Severity:** High (requires continuous heap watch)
-**Since:** Stage 6 v0 (updated in Stage 7 v2)
+### #5 — RAM tight after BLE (~51 KB free, improved in 7v3)
+**Severity:** Medium (monitored, improved by PSRAM queue)
+**Since:** Stage 6 v0 (updated in Stage 7 v2 & Stage 7 v3)
 **Symptom:** After BLE init, ~51 KB internal RAM free (largest block ~32 KB).
-**Stage 7 v2 impact:** Adds 3 open files in SD module (~1.5 KB each) and 9 LVGL objects on settings page.
-**Mitigation:** Use PSRAM for any large buffers. Monitor `heap after BLE` in boot log and check minfree numbers reported in periodic (60s) `STATUS` lines in `SYSLOG.TXT`.
+**Stage 7 v3 mitigation:** The 40-item SD writer queue was moved to PSRAM using `xQueueCreateStatic` (with internal RAM fallback). This saves ~16 KB of internal RAM. Monitor `heap after BLE` at boot and check minfree numbers in `SYSLOG.TXT`.
 
 ### #10 — AUTH token value open (waiting for CSE team)
 **Severity:** Medium (blocks secured BLE write validation)
 **Since:** Stage 7 v1 / v2
 **Symptom:** The exact authentication token required for `AUTH:<token>` is not yet specified by the CSE app team.
 **Mitigation:** Default token is empty (`""`). In this state, `TIME` sync is accepted whenever the watch clock is untrusted or unset. The token can be set without recompiling via Serial command `A<token>` and is saved in NVS.
-
-### #11 — Settings buttons act on press
-**Severity:** Low (UI quirk)
-**Since:** Stage 7 v2
-**Symptom:** The settings page buttons (- and + for brightness and timeout) act on press. A swipe gesture between pages that begins on a button can trigger a one-step setting change.
-**Fix planned:** Switch button event handler from `LV_EVENT_PRESSED` to `LV_EVENT_SHORT_CLICKED` or check for drag state.
 
 ### #6 — GPIO42 (AMOLED_EN) polarity unknown
 **Severity:** Low (display works without it)
@@ -91,3 +84,13 @@
 **Fixed in:** `522c8e1` (stage 7 v0)
 **Root cause:** Counter compared consecutive rows; with the gate on, skipped rows showed zero change.
 **Fix:** Counter rewritten to only compare rows with new data.
+
+### ~#R5~ — Settings buttons act on press (FIXED stage 7 v3)
+**Fixed in:** `a7855fd` (stage 7 v3)
+**Root cause:** Buttons triggered on `LV_EVENT_PRESSED`, which caught initial touch of a swipe gesture.
+**Fix:** Changed trigger to `LV_EVENT_RELEASED` with a 20 px drag distance threshold. Swipes no longer alter setting values.
+
+### ~#R6~ — Offline replay damaged line resilience (FIXED stage 7 v3)
+**Fixed in:** `a7855fd` (stage 7 v3)
+**Root cause:** Power loss or abrupt SD removal during logging could leave an incomplete/corrupted tail row in `BLEBUF.TXT`.
+**Fix:** Added line validation during replay. Incomplete or malformed rows are skipped and counted; valid packets continue streaming at 80 ms ticks without stalling.
