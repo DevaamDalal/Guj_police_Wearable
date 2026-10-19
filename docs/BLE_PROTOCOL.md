@@ -13,13 +13,14 @@
 | Max Packet Size | ~140–175 characters (< 200 chars limit) |
 
 > ⚠️ **UUIDs and name prefix are registered on the Spandan app server — do not change.**
+> 📱 **Mobile App Repository:** [ExponentialGrowth/bletomp](https://github.com/ExponentialGrowth/bletomp) (Flutter app in `ble_to_mp/mobile_app`, Node.js backend in `ble_to_mp/server`)
 
 ## Packet Format (Stage 7 v1 / v2)
 
 Plain text, comma-separated key=value pairs:
 
 ```
-HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,BatV=4.19,CHG=0,accX=0.12,accY=-0.05,accZ=9.81,gX=1.2,gY=-0.8,gZ=0.3,ST=OK,TS=2026-10-18T12:12:00+05:30
+HR=72.0,SpO2=98.0,Temp=36.5,BatPct=85,BatV=4.19,CHG=0,accX=0.12,accY=-0.05,accZ=9.81,gyroX=1.2,gyroY=-0.8,gyroZ=0.3,ST=OK,TS=2026-10-18T12:12:00+05:30
 ```
 
 ### Fields
@@ -29,15 +30,16 @@ HR=72.0,SpO2=98.0,Temp=36.5,Batt=85,BatV=4.19,CHG=0,accX=0.12,accY=-0.05,accZ=9.
 | `HR` | float | Heart rate (bpm) | `--` |
 | `SpO2` | float | Blood oxygen (%) | `--` |
 | `Temp` | float | Skin temperature (°C) | `--` |
-| `Batt` | int | Battery level (%) | `--` |
+| `BatPct` | int | Battery level (%). ⚠️ **Use `BatPct` (or `Battery` / `Bat`)**. Verified from `main.dart:2579`: app checks `batpct`, `battery`, `bat`; does NOT match `Batt`. Server (`input_receiver.js:156`) checks `BatPct` or `Battery`. | `--` |
 | `BatV` | float | Battery voltage (V, e.g. `4.19`) | `--` |
 | `CHG` | int | Charging state (`1` = charging estimate, `0` = discharging) | `0` |
-| `accX`, `accY`, `accZ` | float | Accelerometer (g) | `--` |
-| `gX`, `gY`, `gZ` | float | Gyroscope (dps) | `--` |
+| `accX`, `accY`, `accZ` | float | Accelerometer (g). Matches mobile app and server. | `--` |
+| `gyroX`, `gyroY`, `gyroZ` | float | Gyroscope (dps). ⚠️ **Use `gyroX/Y/Z`**. Mobile app accepts `gyrox` or `gx`, but backend server specifically parses `gyroX/Y/Z`. | `--` |
 | `ST` | string | Status code (`OK`, `WARMUP`, `NO_CONTACT`, `MOTION`, `IMU_MOTION`) | `--` |
 | `TS` | string | ISO timestamp with timezone (e.g. `2026-10-18T12:12:00+05:30`). Sent on every packet (live & buffered) | `--` |
 | `TSQ` | int | Clock quality flag: `0` indicates clock is untrusted/not synced from phone. Key is omitted once synced | (omitted when synced) |
 | `BUF` | int | `1` if this is a replayed offline-buffered packet | (omitted on live packets) |
+| `IR`, `Red` | float | (Optional) Raw PPG values; supported by app `unifiedParse` | (optional) |
 
 ### Status Codes (`ST`)
 
