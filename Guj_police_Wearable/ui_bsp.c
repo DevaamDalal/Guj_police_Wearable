@@ -32,6 +32,7 @@ typedef struct {
   int year, mon, day, hour, min, sec;
   bool timeOk;
   int ble;
+  int sd;
   float battV;
   int battPct;
   bool charging;
@@ -45,6 +46,7 @@ static lv_obj_t *tv, *dots[NUM_PAGES];
 static int s_page = 0;
 
 // tile 0: watch face
+static lv_obj_t *sd_dot, *lbl_sd, *ct_dot, *lbl_ct;
 static lv_obj_t *arc_sec, *lbl_time, *lbl_date, *bat_fill, *lbl_bat, *bat_bolt, *lbl_mini, *lbl_ble;
 // tile 1: vitals
 static lv_obj_t *arc_ring, *lbl_hr, *lbl_spo2, *lbl_temp, *lbl_status;
@@ -161,6 +163,24 @@ static void build_face(lv_obj_t *t) {
   }
 
   lbl_mini = make_label(t, &ui_font_s, COL_RED, "HR -- bpm    SpO2 --%", 162);
+
+  // SD card status next to the title, finger-contact status under the HR / SpO2 line
+  lbl_sd = make_label(t, &ui_font_s, COL_GREY, "SD", -150);
+  lv_obj_align(lbl_sd, LV_ALIGN_CENTER, 112, -150);
+  sd_dot = lv_obj_create(t);
+  style_plain(sd_dot);
+  lv_obj_set_size(sd_dot, 12, 12);
+  lv_obj_set_style_radius(sd_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(sd_dot, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(sd_dot, COL_GREY, 0);
+  lv_obj_align(sd_dot, LV_ALIGN_CENTER, 90, -150);
+  lbl_ct = make_label(t, &ui_font_s, COL_GREY, "NO CONTACT", 190);
+  ct_dot = lv_obj_create(t);
+  style_plain(ct_dot);
+  lv_obj_set_size(ct_dot, 12, 12);
+  lv_obj_set_style_radius(ct_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(ct_dot, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(ct_dot, COL_GREY, 0);
 }
 
 static void build_vitals(lv_obj_t *t) {
@@ -187,7 +207,7 @@ static void build_system(lv_obj_t *t) {
   lbl_i3    = make_label(t, &ui_font_s, COL_AMBER, "RTC --",      115);
 }
 
-// tile 3: settings (brightness and screen timeout). Buttons act on press; values are applied by lcd_bsp.c.
+// tile 3: settings (brightness and screen timeout). Buttons act on release of a tap; values are applied by lcd_bsp.c.
 static const int k_timeouts[] = {15, 30, 60, 120, 300, 0};      // seconds, 0 = never
 #define N_TIMEOUTS ((int)(sizeof(k_timeouts) / sizeof(k_timeouts[0])))
 
@@ -205,7 +225,20 @@ static void update_settings(void) {
   set_text(lbl_tmo, b);
 }
 
+static lv_point_t s_press_pt;
+
 static void settings_btn_cb(lv_event_t *e) {
+  lv_event_code_t ev = lv_event_get_code(e);
+  lv_indev_t *in = lv_indev_get_act();
+  if (in == NULL) return;
+  if (ev == LV_EVENT_PRESSED) { lv_indev_get_point(in, &s_press_pt); return; }
+  // LV_EVENT_RELEASED: act only if the finger stayed put (a tap). A swipe that started on a button changes nothing.
+  lv_point_t p;
+  lv_indev_get_point(in, &p);
+  int dx = p.x - s_press_pt.x, dy = p.y - s_press_pt.y;
+  if (dx < 0) dx = -dx;
+  if (dy < 0) dy = -dy;
+  if (dx > 20 || dy > 20) return;
   int code = (int)(intptr_t)lv_event_get_user_data(e);
   if (code == 0 || code == 1) {
     lcd_set_brightness(lcd_get_brightness() + (code == 1 ? 10 : -10));
@@ -235,6 +268,7 @@ static void make_btn(lv_obj_t *parent, const char *txt, lv_coord_t x, lv_coord_t
   lv_label_set_text(l, txt);
   lv_obj_center(l);
   lv_obj_add_event_cb(b, settings_btn_cb, LV_EVENT_PRESSED, (void *)(intptr_t)code);
+  lv_obj_add_event_cb(b, settings_btn_cb, LV_EVENT_RELEASED, (void *)(intptr_t)code);
 }
 
 static void build_settings(lv_obj_t *t) {
@@ -288,6 +322,21 @@ static void update_face(const ui_data_t *d) {
   if (d->spo2Ok) snprintf(sp, sizeof(sp), "%d", (int)(d->spo2 + 0.5f)); else strcpy(sp, "--");
   snprintf(b, sizeof(b), "HR %s bpm    SpO2 %s%%", hr, sp);
   set_text(lbl_mini, b);
+  lv_color_t sdc = d->sd == 1 ? COL_GREEN : (d->sd == 2 ? COL_RED : COL_GREY);
+  lv_obj_set_style_bg_color(sd_dot, sdc, 0);
+  const char *ctTxt; lv_color_t ctc;
+  if (!strcmp(d->st, "OK"))                                                      { ctTxt = "CONTACT";    ctc = COL_GREEN; }
+  else if (!strcmp(d->st, "NO_CONTACT") || !strcmp(d->st, "STARTING"))           { ctTxt = "NO CONTACT"; ctc = COL_GREY; }
+  else if (!strcmp(d->st, "WARMUP"))                                             { ctTxt = "SETTLING";   ctc = COL_AMBER; }
+  else if (!strcmp(d->st, "MOTION") || !strcmp(d->st, "IMU_MOTION"))             { ctTxt = "MOTION";     ctc = COL_AMBER; }
+  else                                                                           { ctTxt = "CHECKING";   ctc = COL_AMBER; }
+  if (strcmp(lv_label_get_text(lbl_ct), ctTxt) != 0) {
+    lv_label_set_text(lbl_ct, ctTxt);
+    lv_obj_update_layout(lbl_ct);
+    lv_obj_align_to(ct_dot, lbl_ct, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+  }
+  lv_obj_set_style_bg_color(ct_dot, ctc, 0);
+  lv_obj_set_style_text_color(lbl_ct, ctc, 0);
 }
 
 static void update_vitals(const ui_data_t *d) {
@@ -433,6 +482,13 @@ void ui_set_battery(float volts, int percent, bool charging) {
   g_data.battV = volts;
   g_data.battPct = percent;
   g_data.charging = charging;
+  xSemaphoreGive(g_mux);
+}
+
+void ui_set_sd(int state) {
+  if (!g_mux) return;
+  if (xSemaphoreTake(g_mux, 0) != pdTRUE) return;
+  g_data.sd = state;
   xSemaphoreGive(g_mux);
 }
 

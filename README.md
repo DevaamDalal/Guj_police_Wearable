@@ -3,8 +3,8 @@
 Health-monitoring wearable firmware: heart rate, SpO2, skin temperature and motion, shown on a local AMOLED
 touchscreen, logged to an SD card, and (later) sent over BLE.
 
-**Last updated:** 2026-10-18 · **Firmware stage:** 7 v2 (= stage 7 v1 phone time sync / ISO time on every packet / CHG and BatV + screen timeout and brightness settings page + SD event log SYSLOG.TXT) ·
-**Next:** test stage 7 v2 on the watch (time sync with nRF Connect, screen settings, SYSLOG.TXT), then power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
+**Last updated:** 2026-10-19 · **Firmware stage:** 7 v3 (= stage 7 v2 + SD and finger-contact icons on the watch face, settings buttons act on release (issue #11), replay line validation and faster replay, SD queue in PSRAM; stage 7 v2 = stage 7 v1 phone time sync / ISO time on every packet / CHG and BatV + screen timeout and brightness settings page + SD event log SYSLOG.TXT) ·
+**Next:** test stage 7 v3 on the watch (icons, settings buttons, heap line), CSE team does the phone-side time sync test, then power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
 **Focus for now:** whole-device functionality first. Sensor tuning and calibration come later, one topic per chat.
 
 ---
@@ -303,3 +303,14 @@ Display off/dim, lower CPU frequency, log rate options, sleep behaviour; verify 
 Waveshare board datasheet and schematic, SH8601 datasheet, FT3168, PCF85063, QMI8658C and ESP32-S3 datasheets, and the
 Waveshare Arduino examples (`07_LVGL_Test`, `04_SD_Card`, `02_I2C_PCF85063`, `01_ADC_Test`) were used as the basis for the
 drivers in this folder.
+
+
+---
+
+## Stage 7 v3 changes (2026-10-19)
+
+- **Issue #11 fixed:** settings buttons act on release, and only if the finger moved 20 px or less since the press. A swipe no longer changes brightness or timeout.
+- **Step F icons on the watch face:** SD dot next to the title (green = logging, red = error, grey = no card) and a finger contact line under HR/SpO2 (green CONTACT, grey NO CONTACT, amber SETTLING / MOTION / CHECKING).
+- **Offline replay:** next line is requested right after one is taken, tick 80 ms (was about 240 ms per packet). Lines that look damaged (power loss or card removal) are skipped and counted in the REPLAY done event. Packet count estimate uses 155 bytes per packet.
+- **Heap:** the 40-item SD queue (16 KB) now lives in PSRAM (fallback to internal RAM). Expect roughly 16 KB more free internal heap; check the `heap after BLE` boot line and STATUS minfree in SYSLOG.TXT. New LVGL objects: 4 small ones.
+- Touch init retries 10 x 100 ms. Reset reason prints `other (code N)` when unknown.

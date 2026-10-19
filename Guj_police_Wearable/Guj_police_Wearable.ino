@@ -24,7 +24,7 @@
 
 // Device name seen by the app (it registers this name on the server). Keep the SVNIT_CRL_ prefix; change the number per watch.
 #define BLE_DEVICE_NAME "SVNIT_CRL_60"
-#define FW_LABEL        "stage 7 v2 (BLE + offline buffer + time sync + screen settings + event log)"
+#define FW_LABEL        "stage 7 v3 (BLE + offline buffer + time sync + screen settings + event log + status icons)"
 #define USE_BLE 1   // 1 = BLE on (stage 5). 0 = local only. BLE needs the 16M partition scheme (see README).
 #if USE_BLE
 #include <BLEDevice.h>
@@ -865,11 +865,11 @@ static void bleReplayService() {
     if (sdlog_buf_replay(true)) {
       unsigned long by, dr; sdlog_buf_info(&by, &dr);
       on = true; sent = 0; Serial.println("BLE replay: sending stored packets");
-      evt("REPLAY", "started, about %lu stored packets (%lu bytes), %lu dropped so far", by / 130UL, by, dr);
+      evt("REPLAY", "started, about %lu stored packets (%lu bytes), %lu dropped so far", by / 155UL, by, dr);
     }
     return;
   }
-  if (now - last < 100) return;
+  if (now - last < 80) return;                  // the app team asked for 50-100 ms between stored packets
   last = now;
   char line[SDLOG_LINE_MAX];
   int r = sdlog_buf_replay_get(line, sizeof(line));
@@ -883,7 +883,7 @@ static void bleReplayService() {
   } else if (r < 0) {
     on = false;
     Serial.printf("BLE replay done: %lu stored packets sent\n", (unsigned long)sent);
-    evt("REPLAY", "done, %lu stored packets sent", (unsigned long)sent);
+    evt("REPLAY", "done, %lu stored packets sent, %lu damaged lines skipped (all time since boot)", (unsigned long)sent, sdlog_buf_skipped());
   }
 #endif
 }
@@ -953,7 +953,7 @@ static const char *resetReasonName() {
     case ESP_RST_WDT:       return "other watchdog";
     case ESP_RST_BROWNOUT:  return "BROWNOUT (supply dipped)";
     case ESP_RST_DEEPSLEEP: return "deep sleep wake";
-    default:                return "other";
+    default: { static char other[24]; snprintf(other, sizeof(other), "other (code %d)", (int)esp_reset_reason()); return other; }
   }
 }
 static void eventService() {
@@ -1022,7 +1022,7 @@ static void infoPush() {
   sdlog_status(l2, sizeof(l2));
   if (sdlog_buf_pending() && strlen(l2) < 26) {   // show how much BLE data is waiting for the app
     unsigned long by, dr; sdlog_buf_info(&by, &dr);
-    snprintf(l2 + strlen(l2), sizeof(l2) - strlen(l2), " buf %lu", by / 130UL);
+    snprintf(l2 + strlen(l2), sizeof(l2) - strlen(l2), " buf %lu", by / 155UL);
   }
   snprintf(l3, sizeof(l3), "%s%s", rtcStr, clockTrusted ? "" : " (not synced)");
   ui_set_info(l1, l2, l3);
@@ -1031,6 +1031,7 @@ static void infoPush() {
 #if USE_BLE
   ui_set_ble(deviceConnected ? 1 : 0);
 #endif
+  ui_set_sd(sdlog_state());
 }
 
 void setup() {
@@ -1050,9 +1051,9 @@ void setup() {
   initMLX90614();
   {   // the touch chip can need a moment after power-up: retry a few times before giving up
     bool touchOk = false;
-    for (int i = 0; i < 6 && !touchOk; i++) { bootTouchTries = i + 1; touchOk = touch_init(); if (!touchOk) delay(50); }
+    for (int i = 0; i < 10 && !touchOk; i++) { bootTouchTries = i + 1; touchOk = touch_init(); if (!touchOk) delay(100); }   // the touch chip can need up to ~1 s after power-up
     bootTouchOk = touchOk;
-    Serial.println(touchOk ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38) after 6 tries");
+    Serial.println(touchOk ? "FT3168 touch OK" : "FT3168 touch NOT found (0x38) after 10 tries (touch may still work later)");
   }
 
   // Display first: it needs the biggest contiguous internal-RAM blocks (LVGL draw buffers)

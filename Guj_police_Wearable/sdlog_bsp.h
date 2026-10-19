@@ -29,6 +29,8 @@ bool sdlog_buf_pending(void);                    // true while BLEBUF.TXT holds 
 bool sdlog_buf_replay(bool start);               // true = begin/resume replay, false = pause it (link lost). false return = retry
 int  sdlog_buf_replay_get(char *out, size_t n);  // 1 = line returned, 0 = nothing yet (call again), -1 = replay finished (file deleted)
 void sdlog_buf_info(unsigned long *bytes, unsigned long *dropped);
+unsigned long sdlog_buf_skipped(void);           // damaged lines in BLEBUF.TXT that were skipped instead of sent
+int  sdlog_state(void);                          // 0 = no card, 1 = logging, 2 = write error
 
 #ifdef __cplusplus
 }

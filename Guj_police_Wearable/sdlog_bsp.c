@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 #include "sdlog_bsp.h"
 
 #define SD_PIN_MISO   40
@@ -47,7 +48,7 @@ const char *sdlog_last_error(void) { return s_err; }
 static FILE *s_bf = NULL;                          // BLEBUF.TXT, opened "a+" (one handle: append at the end, read at s_rd_pos)
 static long s_rd_pos = 0;                          // start of the next line to deliver
 static volatile bool s_buf_pending = false;        // read by the loop task
-static volatile unsigned long s_buf_bytes = 0, s_buf_dropped = 0;
+static volatile unsigned long s_buf_bytes = 0, s_buf_dropped = 0, s_buf_skipped = 0;
 static bool s_buf_dirty = false;
 static volatile bool s_rp_on = false;              // replay requested
 static volatile int s_rp_state = 0;                // 0 idle, 1 loop wants a line, 2 line ready, 3 finished
@@ -119,7 +120,14 @@ static void bufReplayRead(void)                    // called when s_rp_state == 
     long next = ftell(s_bf);
     size_t n = strlen(s_rp_line);
     while (n > 0 && (s_rp_line[n - 1] == '\n' || s_rp_line[n - 1] == '\r')) s_rp_line[--n] = '\0';
-    if (n < 8) { s_rd_pos = next; continue; }      // empty or torn line (power loss): skip it
+    // A stored packet looks like  HR=...,Batt=...,...,BUF=1 . After a power cut the end of the file can hold torn or stale
+    // data from an older file; such lines must never be sent to the app.
+    if (n < 40 || strncmp(s_rp_line, "HR=", 3) != 0 || strstr(s_rp_line, ",Batt=") == NULL || strcmp(s_rp_line + n - 6, ",BUF=1") != 0)
+    {
+      s_buf_skipped++;
+      s_rd_pos = next;
+      continue;
+    }
     s_rp_next = next;
     __sync_synchronize();
     s_rp_state = 2;
@@ -212,7 +220,12 @@ bool sdlog_begin(void)
   if (s_ef != NULL) { fseek(s_ef, 0, SEEK_END); s_ev_bytes = (unsigned long)ftell(s_ef); }
   else printf("SD: cannot open SYSLOG.TXT (no event log)\n");
 
-  s_q = xQueueCreate(SDLOG_QUEUE_LEN, SDLOG_LINE_MAX);
+  // The queue holds 40 lines of 400 bytes = 16 KB. Its storage goes to PSRAM so the scarce internal RAM stays free
+  // (falls back to internal RAM if PSRAM is not available).
+  static StaticQueue_t s_qstruct;
+  uint8_t *qmem = (uint8_t *)heap_caps_malloc((size_t)SDLOG_QUEUE_LEN * SDLOG_LINE_MAX, MALLOC_CAP_SPIRAM);
+  if (qmem != NULL) s_q = xQueueCreateStatic(SDLOG_QUEUE_LEN, SDLOG_LINE_MAX, qmem, &s_qstruct);
+  else s_q = xQueueCreate(SDLOG_QUEUE_LEN, SDLOG_LINE_MAX);
   if (s_q == NULL) { fclose(s_file); s_file = NULL; snprintf(s_err, sizeof(s_err), "log queue allocation failed (RAM)"); return false; }
   s_state = 1;
   xTaskCreatePinnedToCore(sdlog_task, "sdlog", 6 * 1024, NULL, 1, NULL, 0);
@@ -296,7 +309,7 @@ int sdlog_buf_replay_get(char *out, size_t n)
     __sync_synchronize();
     strncpy(out, s_rp_line, n - 1); out[n - 1] = '\0';
     s_rd_pos = s_rp_next;                          // the line is taken; next read starts after it
-    s_rp_state = 0;
+    s_rp_state = 1;                                // ask for the next line right away so it is ready at the next tick
     return 1;
   }
   if (st == 0) s_rp_state = 1;                     // ask the writer task for the next line
@@ -304,5 +317,7 @@ int sdlog_buf_replay_get(char *out, size_t n)
 }
 
 void sdlog_buf_info(unsigned long *bytes, unsigned long *dropped) { *bytes = s_buf_bytes; *dropped = s_buf_dropped; }
+unsigned long sdlog_buf_skipped(void) { return s_buf_skipped; }
+int sdlog_state(void) { return s_state; }
 
 void sdlog_event(const char *line) { bufSend(CMD_EVENT, line); }
