@@ -3,7 +3,7 @@
 Health-monitoring wearable firmware: heart rate, SpO2, skin temperature and motion, shown on a local AMOLED
 touchscreen, logged to an SD card, and (later) sent over BLE.
 
-**Last updated:** 2026-10-19 · **Firmware stage:** 7 v3 (= stage 7 v2 + SD and finger-contact icons on the watch face, settings buttons act on release (issue #11), replay line validation and faster replay, SD queue in PSRAM; stage 7 v2 = stage 7 v1 phone time sync / ISO time on every packet / CHG and BatV + screen timeout and brightness settings page + SD event log SYSLOG.TXT) ·
+**Last updated:** 2026-10-19 · **Firmware stage:** 7 v3.1 (= stage 7 v3 + boot supervision: I2C bus clear, sensor retry, boot-stage memory, boot and loop watchdogs; stage 7 v3 = stage 7 v2 + SD and finger-contact icons on the watch face, settings buttons act on release (issue #11), replay line validation and faster replay, SD queue in PSRAM; stage 7 v2 = stage 7 v1 phone time sync / ISO time on every packet / CHG and BatV + screen timeout and brightness settings page + SD event log SYSLOG.TXT) ·
 **Next:** test stage 7 v3 on the watch (icons, settings buttons, heap line), CSE team does the phone-side time sync test, then power (Step G). Out-of-range reconnect test passed 2026-10-16; offline buffer and charging bolt verified on the watch 2026-10-17. Watch name is now `SVNIT_CRL_60`. Sensors are still on a breadboard; moving them to a proper mount is planned.
 **Focus for now:** whole-device functionality first. Sensor tuning and calibration come later, one topic per chat.
 
@@ -314,3 +314,23 @@ drivers in this folder.
 - **Offline replay:** next line is requested right after one is taken, tick 80 ms (was about 240 ms per packet). Lines that look damaged (power loss or card removal) are skipped and counted in the REPLAY done event. Packet count estimate uses 155 bytes per packet.
 - **Heap:** the 40-item SD queue (16 KB) now lives in PSRAM (fallback to internal RAM). Expect roughly 16 KB more free internal heap; check the `heap after BLE` boot line and STATUS minfree in SYSLOG.TXT. New LVGL objects: 4 small ones.
 - Touch init retries 10 x 100 ms. Reset reason prints `other (code N)` when unknown.
+
+
+## Stage 7 v3.1: watch stuck after the serial monitor is closed (2026-10-19)
+
+**Symptom (Devaam):** with the Serial Monitor open the watch works. Closing the monitor reboots the watch and it shows `--:--` and no HR/SpO2. Opening the monitor reboots it again and everything works. Seen since stage 7 v1.
+
+**What the logs show:** SYSLOG reset reason `code 11` is `ESP_RST_USB`: the PC resets the chip through the USB serial port when the monitor opens or closes (same as after an upload). That reset is normal and cannot be removed from firmware. SYSLOG has no BOOT line for the stuck boot (the gap between 11:57:36 and the next boot), so that boot never got as far as the event log. Working theory: the reset hits while the loop is in the middle of an I2C transfer, a chip keeps SDA low, and the next boot cannot talk to the RTC / MAX30102 (time `--:--`, no HR). The second reset happens while the bus is idle, so it recovers. This is not proven yet.
+
+**Changes in v3.1:**
+- `i2cBusClear()` before `Wire.begin`: if SDA or SCL is low at boot, up to 16 clock pulses and a STOP free the bus.
+- After the sensor init the code probes MAX30102, QMI8658, MLX90614 and the RTC; if MAX, IMU or RTC is missing it clears the bus and re-inits (up to 3 tries).
+- Boot-stage memory in RTC_NOINIT RAM (survives USB/software resets): the next boot logs `previous boot did not finish setup (stopped at step N of 8)`.
+- Boot watchdog (25 s software timer): if setup() has not finished it restarts the chip, up to 3 times.
+- Loop watchdog (`enableLoopWDT`, 5 s): a loop() that stops restarts the watch; reset reason shows as `task watchdog`.
+- SYSLOG boot report has two new lines: `i2c bus free / was stuck, freed / STUCK` and `sensors MAX=1 IMU=1 MLX=1 RTC=1 after N tries`.
+- Reset reason 11 prints as `USB reset (serial monitor opened/closed, or upload)`.
+
+**How to test:** run the watch, close the Serial Monitor, wait 10 s. The watch should come back with a normal clock within about 5 s (or after one automatic restart). Then read SYSLOG.TXT: look for the `i2c bus` and `sensors` BOOT lines and any `ERR previous boot did not finish` line. If the stuck state still happens and no `ERR` line appears, the hang is not in setup() and the loop watchdog is not firing: report the exact screen (does the date line say `RTC not set`?).
+
+**Workaround without firmware:** Arduino IDE Tools menu, USB Mode "USB-OTG (TinyUSB)" keeps USB CDC but does not reset on DTR/RTS (needs a re-flash; upload then uses the 1200 baud touch). Not changed in this build.

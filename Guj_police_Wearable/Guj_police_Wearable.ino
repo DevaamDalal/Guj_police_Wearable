@@ -21,10 +21,12 @@
 #include <stdarg.h>
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "freertos/timers.h"
 
 // Device name seen by the app (it registers this name on the server). Keep the SVNIT_CRL_ prefix; change the number per watch.
 #define BLE_DEVICE_NAME "SVNIT_CRL_60"
-#define FW_LABEL        "stage 7 v3 (BLE + offline buffer + time sync + screen settings + event log + status icons)"
+#define FW_LABEL        "stage 7 v3.1 (BLE + offline buffer + time sync + screen settings + event log + status icons + boot supervision)"
 #define USE_BLE 1   // 1 = BLE on (stage 5). 0 = local only. BLE needs the 16M partition scheme (see README).
 #if USE_BLE
 #include <BLEDevice.h>
@@ -943,6 +945,7 @@ static void bleRxService() {
 
 // Writes changes to the SD event log (SYSLOG.TXT) and saves screen settings. Called every loop pass; cheap.
 static const char *resetReasonName() {
+  if ((int)esp_reset_reason() == 11) return "USB reset (serial monitor opened/closed, or upload)";   // ESP_RST_USB
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power-on";
     case ESP_RST_EXT:       return "reset button / external";
@@ -1034,21 +1037,105 @@ static void infoPush() {
   ui_set_sd(sdlog_state());
 }
 
+// ───────────── boot supervision (watch hung after the serial monitor was closed) ─────────────
+// Survives software / USB resets (not power-off): the last setup() step reached, and how many boots in a row never finished.
+#define BOOT_MAGIC 0xB007C0DEu
+RTC_NOINIT_ATTR static uint32_t g_bootMagic;
+RTC_NOINIT_ATTR static uint32_t g_bootStage;   // 1 start, 2 i2c, 3 sensors, 4 touch, 5 display, 6 settings+rtc, 7 sd, 8 ble, 99 setup finished
+RTC_NOINIT_ATTR static uint32_t g_bootFails;   // consecutive boots whose setup() did not finish
+static uint32_t g_prevStage = 0, g_prevFails = 0;
+static bool g_prevKnown = false;
+static volatile bool g_bootDone = false;
+static int g_i2cClearClocks = -1;              // -1 bus was free, N = SDA was stuck low and was freed with N clock pulses, -2 could not be freed
+static int g_sensorTries = 0;
+static uint8_t g_sensorMask = 0;               // bit0 MAX30102, bit1 QMI8658, bit2 MLX90614, bit3 RTC
+
+static void bootWdtCb(TimerHandle_t) {         // setup() should take about 3 s; if it hangs, restart (idle, so the I2C bus is released) up to 3 times
+  if (!g_bootDone && g_bootFails <= 3) esp_restart();
+}
+
+// Frees an I2C slave that was left holding SDA low by a reset in the middle of a transfer (up to 16 clock pulses, then a STOP).
+static int i2cBusClear() {
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(20);
+  if (digitalRead(SDA_PIN) == HIGH && digitalRead(SCL_PIN) == HIGH) return -1;
+  int n = 0;
+  pinMode(SCL_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(SCL_PIN, HIGH);
+  while (digitalRead(SDA_PIN) == LOW && n < 16) {
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(10);
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(10);
+    n++;
+  }
+  pinMode(SDA_PIN, OUTPUT_OPEN_DRAIN);          // STOP condition: SDA low -> high while SCL is high
+  digitalWrite(SDA_PIN, LOW);  delayMicroseconds(10);
+  digitalWrite(SCL_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(SDA_PIN, HIGH); delayMicroseconds(10);
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(20);
+  return (digitalRead(SDA_PIN) == HIGH) ? (n > 0 ? n : 1) : -2;
+}
+
+static bool probeI2c(uint8_t addr) {
+  I2Cbus.beginTransmission(addr);
+  return I2Cbus.endTransmission() == 0;
+}
+static uint8_t probeSensors() {
+  uint8_t m = 0;
+  if (probeI2c(MAX30102_ADDR)) m |= 1;
+  if (probeI2c(QMI8658_ADDR))  m |= 2;
+  if (probeI2c(MLX90614_ADDR)) m |= 4;
+  if (probeI2c(0x51))          m |= 8;
+  return m;
+}
+
 void setup() {
+  if (g_bootMagic == BOOT_MAGIC) { g_prevKnown = true; g_prevStage = g_bootStage; g_prevFails = g_bootFails; }
+  else { g_bootMagic = BOOT_MAGIC; g_bootFails = 0; }
+  g_bootFails++;
+  g_bootStage = 1;
+  {
+    TimerHandle_t t = xTimerCreate("bootwdt", pdMS_TO_TICKS(25000), pdFALSE, NULL, bootWdtCb);
+    if (t) xTimerStart(t, 0);
+  }
   Serial.begin(115200);
   delay(200);
 
   // No interrupts: IMU and MAX30102 are polled in loop()
   g_i2cMux = xSemaphoreCreateMutex();
 
-  // Use the ESP32-S3 AMOLED I2C pins
+  // Use the ESP32-S3 AMOLED I2C pins. A reset (for example the USB reset when the serial monitor is closed)
+  // can hit in the middle of an I2C transfer and leave a chip holding SDA low: free the bus first.
+  g_bootStage = 2;
+  g_i2cClearClocks = i2cBusClear();
   I2Cbus.begin(SDA_PIN, SCL_PIN);
   I2Cbus.setClock(100000);   // keep 100 kHz: MLX90614 max is 100 kHz
 
   // Sensor + touch init run BEFORE the LVGL task exists, so no locking needed here
+  g_bootStage = 3;
   initMAX();
   initQMI8658(); // Replaced MPU initialization with QMI8658
   initMLX90614();
+  g_sensorMask = probeSensors();
+  g_sensorTries = 1;
+  while ((g_sensorMask & 0x0B) != 0x0B && g_sensorTries < 3) {   // MAX30102, QMI8658 and RTC are required; retry after a bus clear
+    I2Cbus.end();
+    delay(100);
+    int c = i2cBusClear();
+    if (c != -1) g_i2cClearClocks = c;
+    I2Cbus.begin(SDA_PIN, SCL_PIN);
+    I2Cbus.setClock(100000);
+    delay(100);
+    initMAX();
+    initQMI8658();
+    initMLX90614();
+    g_sensorMask = probeSensors();
+    g_sensorTries++;
+  }
+  Serial.printf("sensors present mask 0x%02X after %d tries (1 MAX, 2 IMU, 4 MLX, 8 RTC)\n", g_sensorMask, g_sensorTries);
+  g_bootStage = 4;
   {   // the touch chip can need a moment after power-up: retry a few times before giving up
     bool touchOk = false;
     for (int i = 0; i < 10 && !touchOk; i++) { bootTouchTries = i + 1; touchOk = touch_init(); if (!touchOk) delay(100); }   // the touch chip can need up to ~1 s after power-up
@@ -1057,11 +1144,13 @@ void setup() {
   }
 
   // Display first: it needs the biggest contiguous internal-RAM blocks (LVGL draw buffers)
+  g_bootStage = 5;
   lcd_lvgl_Init();   // AMOLED + LVGL + touch polling (own task on core 0)
   Serial.printf("display controller: %s (ID 0x%02X)\n", lcd_controller_name(), lcd_controller_id());
   Serial.printf("heap after display: free %u, largest DMA block %u\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
+  g_bootStage = 6;
   prefs.begin("spandan", false);
   tzOffsetMin  = prefs.getInt("tz", DEFAULT_TZ_OFFSET_MIN);
   clockTrusted = prefs.getBool("clkok", false);
@@ -1075,6 +1164,7 @@ void setup() {
   rtcSyncFromBuild();
   Serial.printf("clock: %s, timezone UTC%+d min\n", clockTrusted ? "trusted (set by phone or T command)" : "NOT synced yet (waiting for the phone)", tzOffsetMin);
   updateBattery();
+  g_bootStage = 7;
   if (sdlog_begin()) {
     char hdr[SDLOG_LINE_MAX];
     snprintf(hdr, sizeof(hdr), "# SPANDAN log | start RTC=%s%s | build %s %s | period=%lu ms | VBAT=%.2f",
@@ -1087,6 +1177,7 @@ void setup() {
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
 #if USE_BLE
+  g_bootStage = 8;
   BLEDevice::init(BLE_DEVICE_NAME);
   BLEDevice::setMTU(517);                       // the app asks for 512 on Android; allow it
   BLEServer *pServer = BLEDevice::createServer();
@@ -1117,7 +1208,18 @@ void setup() {
     evt("BOOT", "settings: brightness %d%%, screen off after %d s, AUTH token %s | %lu bytes of undelivered BLE data on SD", lcd_get_brightness(), lcd_get_screen_timeout(), authToken[0] ? "set" : "NOT set", by);
     evt("BOOT", "heap free=%u minfree=%u largest internal block=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    evt("BOOT", "i2c bus %s | sensors MAX=%d IMU=%d MLX=%d RTC=%d after %d tries",
+        g_i2cClearClocks == -1 ? "free" : (g_i2cClearClocks == -2 ? "STUCK (could not be freed)" : "was stuck, freed"),
+        (g_sensorMask & 1) ? 1 : 0, (g_sensorMask & 2) ? 1 : 0, (g_sensorMask & 4) ? 1 : 0, (g_sensorMask & 8) ? 1 : 0, g_sensorTries);
+    if (g_prevKnown && g_prevStage != 99)
+      evt("ERR", "previous boot did not finish setup (stopped at step %u of 8, %u failed boots in a row)", (unsigned)g_prevStage, (unsigned)g_prevFails);
+    else if (g_prevKnown)
+      evt("BOOT", "previous run was healthy (setup had finished)");
   }
+  g_bootStage = 99;
+  g_bootFails = 0;
+  g_bootDone = true;
+  enableLoopWDT();   // from now on a loop() that stops for 5 s restarts the watch (reset reason "task watchdog")
   Serial.println("\n" BLE_DEVICE_NAME " READY (ESP32-S3 AMOLED)  firmware: " FW_LABEL ", build " __DATE__ " " __TIME__);
   Serial.println("Commands: F = 30 s FIFO diagnostic (just press F, then Send), T2026-10-13 15:30:00 = set clock (the phone sets it over BLE too), ? = status and all commands");
   Serial.println("Columns: FIFO_IR,FIFO_RED,S1_IR,S1_RED,IR_DC,IR_AC,RED_DC,RED_AC,HR,SpO2,ObjT,AmbT,accX,accY,accZ,gX,gY,gZ,ST");
