@@ -304,6 +304,18 @@ Waveshare board datasheet and schematic, SH8601 datasheet, FT3168, PCF85063, QMI
 Waveshare Arduino examples (`07_LVGL_Test`, `04_SD_Card`, `02_I2C_PCF85063`, `01_ADC_Test`) were used as the basis for the
 drivers in this folder.
 
+## 11. Multi-Department Project Integration & Report References
+
+Project SPANDAN is an institutional collaboration between SVNIT Surat and Gujarat Police. The full multi-tier architecture integrates:
+* **ECE Department**: Wearable sensing hardware and firmware (this repository).
+* **Mobile App Gateway**: Flutter BLE background bridge repository ([bletomp](https://github.com/ExponentialGrowth/bletomp.git)).
+* **CSE Department**: Command web dashboard and ingestion backend ([guardian-health](https://github.com/Sinaker/guardian-health)).
+* **AI Department**: Machine learning models for physical stress and focus detection ([Spandan](https://github.com/THE-DEEPDAS/Spandan)).
+
+For comprehensive technical documentation, formulas, and replication steps, refer to:
+* [`docs/PROJECT_REPORT_DATA.md`](docs/PROJECT_REPORT_DATA.md) — Complete BOM, battery calculations, mathematical algorithms, AI benchmarks, and report data.
+* [`docs/REPLICATION_GUIDE.md`](docs/REPLICATION_GUIDE.md) — Step-by-step replication playbook across ECE, Flutter App, CSE Server, and AI Models.
+
 
 ---
 
