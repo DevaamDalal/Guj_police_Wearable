@@ -38,6 +38,18 @@
 **Symptom:** The exact authentication token required for `AUTH:<token>` is not yet specified by the CSE app team.
 **Mitigation:** Default token is empty (`""`). In this state, `TIME` sync is accepted whenever the watch clock is untrusted or unset. The token can be set without recompiling via Serial command `A<token>` and is saved in NVS.
 
+### #12 — Stuck boot after Serial Monitor is closed (investigating in 7v3.1)
+**Severity:** High (intermittent boot hang on host disconnect)
+**Since:** Stage 7 v1 / v2 (observed in v3)
+**Symptom:** When the host Serial Monitor is closed, the host sends DTR/RTS signals triggering an ESP32-S3 USB reset (`ESP_RST_USB`, code 11). The watch reboots and stays stuck showing `--:--` with no HR/SpO2 until the Serial Monitor is opened again.
+**Suspected root cause:** Host reset occurring mid-I2C bus transaction may leave an I2C slave holding SDA low, hanging subsequent I2C transactions in `setup()`.
+**Fix added in Stage 7 v3.1:**
+- `i2cBusClear()` runs prior to `Wire.begin` (9 clock pulses + STOP to release hung SDA/SCL lines).
+- Post-init probe of MAX30102, QMI8658, MLX90614, and RTC with up to 3 retries and automatic bus clearing.
+- `RTC_NOINIT` memory records boot stage and failed boot counter to log exact crash/freeze points in SYSLOG.
+- Hardware boot watchdog (25 s, max 3 restarts) and FreeRTOS loop watchdog (`enableLoopWDT`).
+**Pending verification:** Flash Stage 7 v3.1 and test closing Serial Monitor without hanging.
+
 ### #6 — GPIO42 (AMOLED_EN) polarity unknown
 **Severity:** Low (display works without it)
 **Since:** Always

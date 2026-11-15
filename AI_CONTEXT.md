@@ -10,10 +10,10 @@ touchscreen, logs to SD card, and transmits over BLE to the "Spandan" mobile app
 
 ## Current State
 
-- **Firmware stage:** 7 v3 (status icons + settings touch filter + replay validation + PSRAM queue)
-- **Git tag:** `stage7-v3-status-icons`
-- **What works:** Display, touch, UI (4 screens: watch face, vitals, system, settings), screen timeout / touch wake, status icons (SD dot, contact line), settings buttons on release with 20px drag filter (#11 fixed), SD queue in PSRAM (~16 KB internal heap saved), SD logging + SYSLOG.TXT, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app with offline buffer replay & corruption validation, inbound TIME sync & AUTH handling
-- **What's next:** On-device testing of stage 7 v3 → Power management (Step G) & hardware verification (AUTH token value, CSE time sync test, RTC backup cell)
+- **Firmware stage:** 7 v3.1 (boot supervision, I2C bus clear, sensor retry, boot/loop watchdog)
+- **Git tag:** `stage7-v3.1-boot-supervision`
+- **What works:** Display, touch, UI (4 screens: watch face, vitals, system, settings), screen timeout / touch wake, status icons (SD dot, contact line), settings buttons on release with 20px drag filter, SD queue in PSRAM (~16 KB internal heap saved), SD logging + SYSLOG.TXT, RTC, HR/SpO2 algorithm with FIFO gate, BLE to app with offline buffer replay & corruption validation, inbound TIME sync & AUTH handling, boot supervision & watchdog
+- **What's next:** On-device verification of stage 7 v3.1 (stuck boot test after closing Serial Monitor) → Power management (Step G) & hardware verification (AUTH token value, CSE time sync test, RTC backup cell)
 
 ## Repo Structure
 

@@ -1,8 +1,8 @@
 # Roadmap & Status — Spandan Wearable
 
-> **Current stage:** 7 v3 (status icons + settings touch filter + replay validation)
-> **Current tag:** `stage7-v3-status-icons`
-> **Last updated:** 2026-10-19
+> **Current stage:** 7 v3.1 (boot supervision & watchdog)
+> **Current tag:** `stage7-v3.1-boot-supervision`
+> **Last updated:** 2026-11-15
 
 ---
 
@@ -48,6 +48,8 @@
 | `21ee16d` | — | docs: Update for stage 7 v2 — settings page, SYSLOG.TXT, inbound TIME/AUTH protocol, issues #10 and #11 |
 | `5120944` | — | docs: Update BLE_PROTOCOL.md with verified findings from ExponentialGrowth/bletomp app repo |
 | `a7855fd` | `stage7-v3-status-icons` | Stage 7 v3: status icons (SD, finger contact), settings buttons on release (#11), replay validation, SD queue in PSRAM |
+| `3fd86f8` | — | docs: Update for stage 7 v3 — Step F complete, #11 fixed, replay line validation, SD queue in PSRAM |
+| `04b91fb` | `stage7-v3.1-boot-supervision` | Stage 7 v3.1: boot supervision (I2C bus clear, sensor retry, boot stage memory, boot + loop watchdog) |
 
 ---
 
@@ -65,17 +67,18 @@
 | 2026-10-16 | Stage 6 v0 | Out-of-range reconnect test passed — Step D fully closed |
 | 2026-10-17 | Stage 7 v0 | Offline buffer replay verified (LOG0015/LOG0016). Charging bolt on watch face confirmed |
 | 2026-10-18 | Stage 7 v2 | Syntax checked with stubs; SD event log & buffer logic host-tested. Settings page & screen sleep/wake built |
-| 2026-10-19 | Stage 7 v3 | Host-tested with damaged BLEBUF.TXT (22 lines replayed, 3 skipped); watch face rendered headless. Pending on-device verification: SD dot, contact line, settings button drag filter, heap after BLE with PSRAM queue |
+| 2026-10-19 | Stage 7 v3 | On-device test (Devaam): phone time sync worked (TIME ACCEPTED), replay worked (202 & 43 pkts), heap after BLE free 64 KB (16 KB internal saved via PSRAM queue). New open issue: stuck boot after Serial Monitor close |
+| 2026-11-15 | Stage 7 v3.1 | Built with I2C bus clear, sensor retry, boot stage logging & watchdog. Pending on-device verification to confirm stuck-boot fix |
 
 ---
 
-## Memory Budget (stage 6 v0)
+## Memory Budget (stage 7 v3 / v3.1)
 
-| After | Free Internal | Largest Block | Warning |
-|-------|--------------|---------------|---------|
+| After | Free Internal | Largest Block | Notes |
+|-------|--------------|---------------|-------|
 | Display | 153 KB | 102 KB | |
 | SD | 126 KB | 78 KB | |
-| **BLE** | **51 KB** | **32 KB** | ⚠️ Tight — use PSRAM for new buffers |
+| **BLE** | **~64 KB** | **~31.7 KB** | Gained ~16 KB internal heap in 7v3 by placing SD queue in PSRAM (`xQueueCreateStatic`) |
 
 ---
 
